@@ -1,6 +1,6 @@
 {
   "name": "afterhours-native",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "AfterHours Windows WPF native poker client with private local rules process",

@@ -32,12 +32,12 @@ export function decisionProfile(obs){
   const t=obs.traits??{},p=obs.plan??{};
   const tilt=obs.tilt,weak=tilt?.strength==='weakened',over=tilt?.strength==='overconfident';
   const level=clamp(Number(obs.level??(.75+(t.levelShift??-.25))));
-  return {looseness:clamp(base.looseness*.72+.42*.28+(t.rangeShift??0)+(p.rangeShift??0)+(weak?-.10:over?.08:0),.08,.91),aggression:clamp(base.aggression*.72+.5*.28+(t.aggressionShift??0)+(p.aggressionShift??0)+(weak?-.16:over?.12:0),.12,.9),bluff:clamp(base.bluff*.68+.10*.32+(t.bluffShift??0)+(weak?-.035:over?.04:0),.018,.35),discipline:clamp(base.discipline*.8+.65*.2+(weak?-.08:over?-.04:0)+(level-.5)*.12,.16,.97),sizing:base.sizing*.45+.66*.55+(t.sizingShift??0)+(over?.08:0),patience:clamp((t.patience??.18)+(level-.5)*.06,.04,.4),level};
+  // A style changes marginal choices; it never gives a character license to
+  // burn chips. Even the loosest profile keeps a meaningful EV/risk floor.
+  return {looseness:clamp(base.looseness*.72+.42*.28+(t.rangeShift??0)+(p.rangeShift??0)+(weak?-.07:over?.05:0),.10,.80),aggression:clamp(base.aggression*.72+.5*.28+(t.aggressionShift??0)+(p.aggressionShift??0)+(weak?-.10:over?.07:0),.12,.84),bluff:clamp(base.bluff*.55+.075*.45+(t.bluffShift??0)+(weak?-.02:over?.02:0),.006,.16),discipline:clamp(base.discipline*.72+.66*.28+(weak?-.04:over?-.025:0)+(level-.5)*.10,.48,.97),sizing:base.sizing*.45+.66*.55+(t.sizingShift??0)+(over?.05:0),patience:clamp((t.patience??.18)+(level-.5)*.06,.04,.4),level};
 }
 export function chooseBotAction(obs,random=Math.random){
   const s=decisionProfile(obs),l=obs.legal;if(!l)throw new Error('电脑没有合法行动');
-  const fishMode=s.level>=.86&&['low','mid'].includes(obs.stakeLevel)&&random()<.08;
-  if(fishMode){s.looseness=clamp(s.looseness+.07,.08,.95);s.aggression=clamp(s.aggression+.06,.12,.95);s.bluff=clamp(s.bluff+.035,.018,.4);}
   const count=obs.players.length,distance=(obs.id-obs.button+count)%count,late=distance===0||distance===count-1,headsUp=count===2;
   const live=obs.players.filter(p=>p.id!==obs.id&&!p.folded),raises=obs.actions.filter(a=>a.street===obs.street&&a.action==='raise').length;
   const aggressor=[...obs.actions].reverse().find(a=>a.action==='raise'&&live.some(p=>p.id===a.playerId))?.playerId;
@@ -64,17 +64,22 @@ export function chooseBotAction(obs,random=Math.random){
   if(obs.street==='preflop'){
     const strength=preflopStrength(obs.hole),threshold=.80-s.looseness*.36-(late?.06+(obs.traits?.positionShift??0):0)-(headsUp?.11:0)-response.preflopAdjustment;
     const pressure=Math.min(.29,Math.max(0,callBB-2)*.012)+raises*.032;
+    const facingRaise=raises>0||callBB>2.5;
+    // A character may be loose in unopened pots, but cannot turn that into a
+    // routine defence of 3-bets/4-bets or large opens with weak holdings.
+    const defendFloor=clamp(.51+raises*.115+Math.min(.17,Math.max(0,callBB-2)*.012)+(live.length>1?.025:0),.51,.86);
+    if(facingRaise&&strength<defendFloor)return fallback();
     let enter=sigmoid((strength-threshold-pressure*s.discipline)/.055);
     if(callBB>18&&strength<.89)enter*=1-s.discipline*.72;
-    const bluff=s.bluff*(late||headsUp?1:.48)*bluffMemory/(1+raises*.85+Math.max(0,callBB-4)*.06);
+    const bluff=facingRaise?0:s.bluff*(late||headsUp?1:.48)*bluffMemory/(1+Math.max(0,callBB-4)*.06);
     if(random()>clamp(enter+bluff,0,.995))return fallback();
     const premium=strength>.88,slowPlay=(obs.plan?.slowPlay??random())<s.patience;
-    const raiseChance=premium?(slowPlay?.24:.68+s.aggression*.18):s.aggression*(raises?.52:.8);
+    const raiseChance=facingRaise?(premium?(slowPlay?.10:.24+s.aggression*.22):0):(premium?(slowPlay?.24:.68+s.aggression*.18):s.aggression*.8);
     if(l.canRaise&&random()<raiseChance)return raise();
     return {action:l.canCheck?'check':'call'};
   }
   const equity=estimateEquity(obs,random,obs.style==='GRINDER'?140:100);
-  const perceived=clamp(equity+(random()-.5)*((1-s.discipline)*.16+(1-s.level)*.12)),multiway=live.length>1;
+  const perceived=clamp(equity+(random()-.5)*(.025+(1-s.discipline)*.05+(1-s.level)*.045)),multiway=live.length>1;
   const ranks=obs.hole.map(c=>RANKS.indexOf(c[0])+2),known=[...obs.hole,...obs.board],unique=new Set(known.map(c=>RANKS.indexOf(c[0])+2));if(unique.has(14))unique.add(1);
   const flushDraw=obs.board.length<5&&obs.hole.some(c=>known.filter(x=>x[1]===c[1]).length===4);
   const straightDraw=obs.board.length<5&&Array.from({length:10},(_,i)=>i+5).some(hi=>[0,1,2,3,4].filter(d=>unique.has(hi-d)).length===4&&ranks.some(r=>r>=hi-4&&r<=hi));
@@ -84,17 +89,28 @@ export function chooseBotAction(obs,random=Math.random){
   // before a bet/call can mean strength, while a snap action can invite a
   // little more pressure; neither signal is allowed to dominate the cards.
   const heroThink=obs.timing?.lastHeroActionMs,heroTimingRead=heroThink===null||heroThink===undefined?0:heroThink>=8000?.035:heroThink<=1500?-.025:0;
-  const gap=perceived+response.callAdjustment+(loose&&obs.style==='GRINDER'?.04:0)-potOdds-callMargin-heroTimingRead;
+  const priceToPot=l.toCall/Math.max(1,obs.pot),stackRisk=l.toCall/Math.max(1,obs.stack),priceMargin=.02+(1-s.level)*.035+(priceToPot>=.75?.05:0);
+  const gap=perceived+response.callAdjustment+(loose&&obs.style==='GRINDER'?.04:0)-potOdds-callMargin-priceMargin-heroTimingRead;
   const continueChance=sigmoid(gap/.048);
-  // Value hands, draws and occasional air share actions; pressure controls the air frequency.
-  const bluff=s.bluff*bluffMemory*(hasDraw?1.25:obs.board.length===5?.45:.65)*(multiway?.5:1)/(1+raises*.8);
+  // Large calls and stack-committing decisions need enough direct equity.
+  // Draws get only a modest exception and never justify a blind stack-off.
+  if(!l.canCheck){
+    const minimumEquity=potOdds+priceMargin;
+    if(!hasDraw&&perceived<minimumEquity)return {action:'fold'};
+    if(priceToPot>=1&&perceived<.60+(multiway?.04:0))return {action:'fold'};
+    if(stackRisk>=.50&&perceived<.68)return {action:'fold'};
+  }
+  // Value hands, draws and occasional air share actions, but pressure and
+  // multiway pots sharply constrain bluffs to protect long-run EV.
+  const bluff=s.bluff*bluffMemory*(hasDraw?1.15:obs.board.length===5?.32:.52)*(multiway?.35:1)/(1+raises*1.15+priceToPot*.8);
   const continueRoll=random(),raiseRoll=random();
   if(!l.canCheck&&continueRoll>clamp(continueChance+bluff*.4,0,.998))return {action:'fold'};
   const value=sigmoid((perceived-(.57+(.5-s.aggression)*.17))/.07);
   const slowPlay=perceived>.74&&(obs.plan?.slowPlay??.5)<s.patience;
   let raiseChance=value*(.24+s.aggression*.6)+bluff*(1-value);
   if(slowPlay)raiseChance*=.35;
-  if(raises>=2&&perceived<.65)raiseChance*=1-s.discipline*.8;
+  if(raises>=1&&perceived<.68)raiseChance*=1-s.discipline*.82;
+  if(stackRisk>=.40&&perceived<.75)raiseChance*=.18;
   if(l.canRaise&&raiseRoll<clamp(raiseChance,.015,.91))return raise();
   return {action:l.canCheck?'check':'call'};
 }

@@ -38,12 +38,20 @@ async function dispatch(command,body){
   if(['action','tick','timeout','extend'].includes(command)&&store.session?.engine.hand?.nativePaused)throw new Error('牌局已暂停');
   return service.dispatch(command,body);
 }
+async function reply(request){
+  try{const value=await dispatch(request.command,request.body);process.stdout.write(JSON.stringify({id:request.id,value})+'\n');if(request.command==='shutdown')lines.close();}
+  catch(error){process.stdout.write(JSON.stringify({id:request?.id,error:error.message})+'\n');}
+}
+// Network-backed AI turns must never make an emergency player action wait in
+// the command queue. These calls cancel the outstanding request before they
+// mutate the table, so a late response cannot apply to a newer game state.
+const interruptsAI=request=>request.command==='ai-cancel'||request.command==='end'||request.command==='shutdown'||(request.command==='action'&&request.body?.fastFold===true);
 lines.on('line',line=>{
-  chain=chain.then(async()=>{
-    let request;
-    try{if(line.length>2000000)throw new Error('命令过大');request=JSON.parse(line);const value=await dispatch(request.command,request.body);process.stdout.write(JSON.stringify({id:request.id,value})+'\n');if(request.command==='shutdown')lines.close();}
-    catch(error){process.stdout.write(JSON.stringify({id:request?.id,error:error.message})+'\n');}
-  });
+  let request;
+  try{if(line.length>2000000)throw new Error('命令过大');request=JSON.parse(line);}
+  catch(error){process.stdout.write(JSON.stringify({id:request?.id,error:error.message})+'\n');return;}
+  if(interruptsAI(request)){void reply(request);return;}
+  chain=chain.then(()=>reply(request));
 });
 lines.on('close',()=>{chain.finally(()=>{service.cancel();store.save();process.exit(0);});});
 
