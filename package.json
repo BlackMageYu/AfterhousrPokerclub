@@ -1,0 +1,11 @@
+{
+  "name": "afterhours-native",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AfterHours Windows WPF native poker client with private local rules process",
+  "scripts": {
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File native/build.ps1",
+    "test": "node --test tests/*.test.js"
+  }
+}

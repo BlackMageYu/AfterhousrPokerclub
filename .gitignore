@@ -1,0 +1,24 @@
+# Local player state and generated game records
+.poker-data/
+native-settings.json
+日志/
+backups/
+
+# QA artefacts and local reference comparisons
+qa/
+verification/
+
+# Local music library
+music/*.mp3
+music/*.wav
+music/*.flac
+
+# Rebuildable Windows output and crash reports
+AfterHours.exe
+AfterHours.pdb
+native-errors.log
+startup-error.txt
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
