@@ -37,7 +37,7 @@ test('exposure classification uses the board at the aggressive action, distingui
   assert.equal(classifyExposure(['7h','2d'],[{...action(['Ks','Jd','4c'])[0]},{action:'call',board:['Ks','Jd','4c','7c','7d']}]).kind,'air_bluff');
 });
 test('normal showdown teaches public cards; hidden folded cards and actual deck never enter bot observation',()=>{
-  const e=new HoldemEngine({seats:3,styles:['TAG','GRINDER']});e.startHand();e.act(0,'fold');passiveFinish(e);
+  const e=new HoldemEngine({seats:3,styles:['TAG','GRINDER']});e.startHand();e.act(e.hand.actor,'call');e.act(0,'fold');passiveFinish(e);
   assert.equal(e.memories[1][0].shownHands,0);assert.equal(e.memories[2][0].shownHands,0);
   assert.equal(e.memories[1][2].shownHands,1);assert.equal(e.memories[2][1].shownHands,1);
   const before=botObservation(e,1);e.players[0].hole=['Ah','Ad'];e.hand.deck.reverse();assert.deepEqual(botObservation(e,1),before);
@@ -65,6 +65,7 @@ test('live and ended service hide undiscovered types even in replay and reports 
     assert.deepEqual(fs.readdirSync(path.join(root,'日志')),[]);
     store.session.engine=bluffHand();store.session.engine.showCards();store.save();
     const h=store.dispatch('history?hand=1');assert.equal(h.players[1].style,'UNKNOWN');assert.equal(h.hand.memoryUpdates,undefined);assert.equal(h.hand.finalPlayers,undefined);
+    const compact=store.dispatch('compact-history?hand=1');assert.equal(compact.players[1].style,'UNKNOWN');assert.equal(compact.hand.deck,undefined);assert.deepEqual(compact.hand.results.find(result=>result.playerId===1).hole,[]);assert.equal(compact.hand.results.find(result=>result.playerId===0).hole.length,2);
     const restored=new GameStore({root});assert.deepEqual(restored.session.engine.memories,store.session.engine.memories);
     state=store.dispatch('end',{sessionId:store.session.id});assert.equal(state.lastSummary.opponents[0].style,'UNKNOWN');
     const report=JSON.parse(fs.readFileSync(path.join(root,'日志',state.lastSummary.reports.json),'utf8'));

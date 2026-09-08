@@ -6,7 +6,7 @@ import path from 'node:path';
 import http from 'node:http';
 import {once} from 'node:events';
 import {AISettings,completionEndpoint} from '../src/ai-settings.js';
-import {AIGameService,requestDecision,externalObservation,validateDecision,testObservation,AIError} from '../src/external-ai.js';
+import {AIGameService,requestDecision,externalObservation,compactExternalObservation,decisionEffort,localRuleDecision,validateDecision,testObservation,aiActionWindowMs,BOT_ACTION_WINDOW_MS,ALL_IN_CALL_WINDOW_MS,AIError} from '../src/external-ai.js';
 import {GameStore} from '../src/store.js';
 
 function temporary(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'poker-api-'));t.after(()=>{const absolute=path.resolve(root);assert.ok(absolute.startsWith(path.resolve(os.tmpdir())+path.sep)&&path.basename(root).startsWith('poker-api-'));fs.rmSync(absolute,{recursive:true,force:true});});return root;}
@@ -14,11 +14,12 @@ async function endpoint(t,handler){const server=http.createServer(handler);serve
 const read=async req=>{let body='';for await(const chunk of req)body+=chunk;return JSON.parse(body);};
 function respond(res,action,extra={}){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{message:{content:JSON.stringify(action)}}],...extra}));}
 const payload=store=>({sessionId:store.session.id,handNumber:store.session.engine.hand.number,eventCount:store.session.engine.hand.events.length});
-function game(t,baseUrl='https://example.invalid/v1',options={}){const root=temporary(t),store=new GameStore({root}),settings=new AISettings({root});settings.update({mode:'external',baseUrl,model:'test-model',apiKey:'fake-test-key',timeoutSeconds:5});const service=new AIGameService(store,settings,options);store.dispatch('start',{config:{seats:2}});store.dispatch('action',{...payload(store),action:'call'});return {root,store,settings,service};}
+function game(t,baseUrl='https://example.invalid/v1',options={}){const root=temporary(t),store=new GameStore({root}),settings=new AISettings({root});settings.update({mode:'external',baseUrl,model:'test-model',apiKey:'fake-test-key',timeoutSeconds:5});const service=new AIGameService(store,settings,{useLocalRules:false,...options});store.dispatch('start',{config:{seats:2}});store.dispatch('action',{...payload(store),action:'call'});return {root,store,settings,service};}
 
 test('settings normalize endpoints, retain secrets only for the same endpoint and never return or store plain keys',t=>{
   const root=temporary(t),secret='example-secret-never-log',adapter={protect:key=>{assert.equal(key,secret);return 'test-ciphertext';},unprotect:value=>{assert.equal(value,'test-ciphertext');return secret;}};
   const settings=new AISettings({root,...adapter});settings.update({mode:'external',baseUrl:'https://example.invalid/v1/',model:'m',apiKey:secret});
+  assert.equal(settings.config.timeoutSeconds,20);
   assert.equal(completionEndpoint(settings.config.baseUrl),'https://example.invalid/v1/chat/completions');assert.equal(completionEndpoint('https://example.invalid'),'https://example.invalid/v1/chat/completions');
   assert.equal(completionEndpoint('http://localhost:1234/custom/chat/completions'),'http://localhost:1234/custom/chat/completions');
   assert.equal(settings.preview({apiKey:''}).apiKey,secret);assert.equal(settings.preview({baseUrl:'https://another.invalid/v1'}).apiKey,'');assert.equal(settings.preview({clearKey:true}).apiKey,'');
@@ -28,11 +29,26 @@ test('settings normalize endpoints, retain secrets only for the same endpoint an
   assert.throws(()=>settings.update({timeoutSeconds:0}));
 });
 
+test('only a call facing an all-in receives the extended forty-second AI window',()=>{
+  const ordinary={...testObservation(),legal:{...testObservation().legal,toCall:10,fullToCall:10}};
+  const allIn={...ordinary,players:ordinary.players.map(player=>player.id===0?{...player,allIn:true}:player)};
+  assert.equal(aiActionWindowMs(ordinary),BOT_ACTION_WINDOW_MS);
+  assert.equal(aiActionWindowMs(allIn),ALL_IN_CALL_WINDOW_MS);
+  assert.equal(aiActionWindowMs({...allIn,legal:{...allIn.legal,toCall:0}}),BOT_ACTION_WINDOW_MS);
+});
+
 test('external observation isolates the acting seat and does not expose hidden cards, deck or other styles',t=>{
   const {store}=game(t),e=store.session.engine,obs=externalObservation(store);
   assert.equal(obs.id,1);assert.deepEqual(obs.hole,e.players[1].hole);assert.equal(obs.players[0].hole,undefined);assert.equal(obs.players[0].style,undefined);assert.equal(obs.deck,undefined);assert.equal(obs.burned,undefined);assert.equal(obs.memories,undefined);
   e.players[0].hole=['2c','2d'];e.hand.deck.reverse();assert.deepEqual(externalObservation(store),obs);
   assert.ok(obs.legal);assert.ok(obs.requestId.endsWith(':1'));
+});
+
+test('external prompt is compact and routes none, low and medium reasoning by decision risk',()=>{
+  const low=testObservation(),compact=compactExternalObservation(low);
+  assert.equal(decisionEffort(low),'none');assert.equal(compact.reasoningEffort,'none');assert.equal(compact.character,undefined);assert.equal(compact.playerCard,undefined);assert.equal(compact.players[0].hole,undefined);
+  assert.equal(decisionEffort({...low,street:'river'}),'low');assert.equal(decisionEffort({...low,legal:{...low.legal,toCall:20},pot:20}),'low');assert.equal(decisionEffort({...low,legal:{...low.legal,toCall:500},stack:900}),'medium');
+  assert.equal(localRuleDecision(low,()=>.5).reason,'free-check');
 });
 
 test('decision validation preserves betting rules including short all-ins and unopened raise rights',()=>{
@@ -45,7 +61,7 @@ test('decision validation preserves betting rules including short all-ins and un
 test('compatible API sends only two stateless messages and validates the model response over HTTP',async t=>{
   let seen;const baseUrl=await endpoint(t,async(req,res)=>{seen={url:req.url,auth:req.headers.authorization,body:await read(req)};respond(res,{action:'raise',raiseTo:25},{usage:{prompt_tokens:120,completion_tokens:16,total_tokens:136}});});
   const result=await requestDecision({baseUrl,model:'chosen-model',apiKey:'fake-test-key',timeoutSeconds:5},testObservation());
-  assert.equal(seen.url,'/v1/chat/completions');assert.equal(seen.auth,'Bearer fake-test-key');assert.equal(seen.body.model,'chosen-model');assert.equal(seen.body.stream,false);assert.equal(seen.body.messages.length,2);assert.equal(JSON.parse(seen.body.messages[1].content).requestId,'connection-test');assert.equal(result.decision.amount,25);assert.equal(result.usage.total_tokens,136);
+  assert.equal(seen.url,'/v1/chat/completions');assert.equal(seen.auth,'Bearer fake-test-key');assert.equal(seen.body.model,'chosen-model');assert.equal(seen.body.stream,false);assert.equal(seen.body.temperature,.15);assert.equal(seen.body.max_tokens,32);assert.deepEqual(seen.body.response_format,{type:'json_object'});assert.equal(seen.body.reasoning_effort,'none');assert.equal(seen.body.messages.length,2);const prompt=JSON.parse(seen.body.messages[1].content);assert.equal(prompt.requestId,'connection-test');assert.equal(prompt.character,undefined);assert.equal(result.decision.amount,25);assert.equal(result.usage.total_tokens,136);
 });
 
 test('HTTP errors, invalid JSON, illegal actions and oversize bodies cannot be executed or leak provider text',async t=>{
@@ -67,10 +83,22 @@ test('external turns apply once, failures fall back legally and final reports re
   let broken=false;const baseUrl=await endpoint(t,async(req,res)=>{const body=await read(req),obs=JSON.parse(body.messages[1].content);respond(res,broken?{action:'raise',raiseTo:-1}:{action:obs.legal.canCheck?'check':'call'});});
   const {root,store,service}=game(t,baseUrl),e=store.session.engine;
   await service.dispatch('tick',payload(store));assert.equal(e.hand.aiDecisions.at(-1).source,'external');assert.equal(e.hand.actor,null);
-  await service.dispatch('tick',payload(store));broken=true;await service.dispatch('tick',payload(store));assert.equal(e.hand.aiDecisions.at(-1).source,'fallback');assert.equal(service.state().ai.lastSource,'fallback');
+  await service.dispatch('tick',payload(store));broken=true;await service.dispatch('tick',payload(store));assert.equal(e.hand.aiDecisions.at(-1).source,'fallback');assert.equal(service.state().ai.lastSource,'fallback');assert.equal(e.players.find(player=>player.localManaged)?.localManaged,'本地托管');assert.equal(service.state().session.players.find(player=>player.localManaged)?.localManaged,'本地托管');
   const history=JSON.stringify(service.state());assert.ok(!history.includes('fake-test-key'));assert.equal(service.state().session.hand.aiDecisions,undefined);
   await service.dispatch('end',{sessionId:store.session.id});const report=JSON.parse(fs.readFileSync(path.join(root,'日志',store.lastSummary.reports.json),'utf8'));
   assert.ok(report.hands.flatMap(h=>h.aiDecisions??[]).some(d=>d.source==='external'));assert.ok(report.hands.flatMap(h=>h.aiDecisions??[]).some(d=>d.source==='fallback'));assert.ok(!JSON.stringify(report).includes('fake-test-key'));
+});
+
+test('a slow external turn is locally managed at the twenty-second action window',async t=>{
+  const slow=(_config,_observation,{signal})=>new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(new AIError('cancelled','cancelled')),{once:true}));
+  const {store,service}=game(t,undefined,{request:slow,actionWindowMs:5}),e=store.session.engine;
+  await service.dispatch('tick',payload(store));const decision=[...e.hands,e.hand].flatMap(hand=>hand.aiDecisions??[]).at(-1);
+  assert.equal(decision.source,'fallback');assert.equal(decision.errorCode,'action_window');assert.equal(e.players[decision.playerId].localManaged,'本地托管');
+});
+
+test('check and ordinary preflop entries bypass the provider through local rules',async t=>{
+  let calls=0;const {store,service}=game(t,undefined,{useLocalRules:true,request:()=>{calls++;throw new Error('provider should not be called');}}),e=store.session.engine;
+  await service.dispatch('tick',payload(store));assert.equal(calls,0);assert.equal(e.hand.aiDecisions.at(-1).source,'local-rule');assert.equal(service.state().ai.lastSource,'local-rule');
 });
 
 test('duplicate ticks coalesce; changing credentials cancels pending decisions; mode changes wait until leaving',async t=>{

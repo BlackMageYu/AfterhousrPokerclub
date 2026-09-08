@@ -13,7 +13,7 @@ const settings=new AISettings({root});
 // Windows DPAPI is owned by the native client. Only ciphertext goes to disk.
 settings.protect=()=>settings.nativeCipher||settings.encryptedKey||'';
 const service=new AIGameService(store,settings);
-const commands=new Set(['state','contacts','archives','archive','history','start','action','tick','next','show','extend','timeout','rebuy','cashout','export','end','claim-daily','guess','profile-settings','ai-settings','ai-test','ai-cancel','music']);
+const commands=new Set(['state','contacts','archives','archive','history','compact-history','start','action','tick','next','show','extend','timeout','rebuy','cashout','export','end','claim-daily','guess','profile-settings','ai-settings','ai-test','ai-cancel','music']);
 let chain=Promise.resolve();
 const lines=readline.createInterface({input:process.stdin,crlfDelay:Infinity});
 async function dispatch(command,body){

@@ -38,7 +38,7 @@ export function decisionProfile(obs){
 }
 export function chooseBotAction(obs,random=Math.random){
   const s=decisionProfile(obs),l=obs.legal;if(!l)throw new Error('电脑没有合法行动');
-  const count=obs.players.length,distance=(obs.id-obs.button+count)%count,late=distance===0||distance===count-1,headsUp=count===2;
+  const count=obs.players.length,distance=(obs.button-obs.id+count)%count,late=distance===0||distance===count-1,headsUp=count===2;
   const live=obs.players.filter(p=>p.id!==obs.id&&!p.folded),raises=obs.actions.filter(a=>a.street===obs.street&&a.action==='raise').length;
   const aggressor=[...obs.actions].reverse().find(a=>a.action==='raise'&&live.some(p=>p.id===a.playerId))?.playerId;
   const response=memoryResponse(obs.style,obs.memory?.[aggressor]);
@@ -53,12 +53,17 @@ export function chooseBotAction(obs,random=Math.random){
     const raw=obs.street==='preflop'&&raises===0?obs.bb*open:obs.streetBet+l.toCall+(obs.pot+l.toCall)*fraction;
     return {action:'raise',amount:Math.min(l.maxRaiseTo,Math.max(l.minRaiseTo,Math.round(raw)))};
   };
-  // Low-level profiles occasionally take an action that is visibly outside
-  // their normal card range. This is bounded, legal, and makes “不理智” a
-  // consequence of level rather than an uncontrolled random crash.
-  const irrationalChance=clamp((.56-s.level)*.20,0,.11);
-  if(irrationalChance&&random()<irrationalChance){
-    const choices=[];if(l.canCheck)choices.push({action:'check'});else choices.push({action:'fold'},{action:'call'});if(l.canRaise)choices.push(raise());
+  // Every profile occasionally mixes a line outside its usual style.  The
+  // mix is deliberately limited to small, non-committing spots: it makes a
+  // TAG capable of an unexpected probe and a LAG capable of a patient fold,
+  // without turning any character into a frequent negative-EV gambler.
+  const pressure=Math.max(l.toCall/Math.max(1,obs.pot),l.toCall/Math.max(1,obs.stack));
+  const safeMix=pressure<.16&&raises<2;
+  const mixUpChance=clamp(.055+(1-s.level)*.075,.055,.13);
+  if(safeMix&&random()<mixUpChance){
+    const choices=[fallback()];
+    if(!l.canCheck&&l.toCall<=obs.bb*4)choices.push({action:'call'});
+    if(l.canRaise&&(l.canCheck||l.toCall<=obs.bb*3))choices.push(raise());
     return choices[Math.floor(random()*choices.length)];
   }
   if(obs.street==='preflop'){

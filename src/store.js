@@ -68,6 +68,10 @@ export class GameStore {
   applyBotDecision(body,decision,metadata={source:'local'}){
     this.checkTurn(body);const e=this.session.engine,h=e.hand,id=h.actor;
     if(id===null||id===0||!e.active)throw new Error('尚未轮到电脑行动');
+    // Keep a visible, player-level marker until a later external decision
+    // succeeds.  This is intentionally not part of the card or strategy data.
+    if(metadata.source==='fallback')e.players[id].localManaged='本地托管';
+    else if(metadata.source==='external')delete e.players[id].localManaged;
     const elapsedMs=Number.isSafeInteger(metadata.thinkTimeMs)&&metadata.thinkTimeMs>=0?metadata.thinkTimeMs:h.botTiming?Math.max(0,Date.now()-h.botTiming.startedAt):undefined;
     h.aiDecisions??=[];h.aiDecisions.push({seq:h.events.length,playerId:id,time:new Date().toISOString(),...metadata,...(elapsedMs!==undefined?{thinkTimeMs:elapsedMs}:{}),action:decision.action,...(decision.amount!==undefined?{raiseTo:decision.amount}:{})});
     try{e.act(id,decision.action,decision.amount,{thinkTimeMs:elapsedMs});}catch(error){h.aiDecisions.pop();throw error;}
@@ -144,6 +148,17 @@ export class GameStore {
       if(name==='state')return this.state();
       if(name==='archives')return {sessions:fs.readdirSync(this.reportDir).filter(n=>/^poker-session-[\w-]+\.json$/.test(n)).sort().reverse().flatMap(n=>{try{const r=JSON.parse(fs.readFileSync(path.join(this.reportDir,n),'utf8'));return r.status==='ended'?[{id:r.sessionId,label:new Date(r.startedAt).toLocaleString('zh-CN',{hour12:false})+` / ${r.config.seats} 人桌`,hands:r.hands.filter(h=>h.status==='complete').length}]:[];}catch{return [];}})};
       if(name==='archive'){const d=this.archive(url.searchParams.get('session'));return {hands:d.hands.map(h=>({number:h.number,status:h.status,board:h.board,hole:h.results.find(r=>r.playerId===0)?.hole,net:h.results.find(r=>r.playerId===0)?.net??0,showdown:h.showdown}))};}
+      if(name==='compact-history'){
+        if(!this.session)throw new Error('请在牌局内打开本局复盘');
+        const handNumber=Number(url.searchParams.get('hand')),source=this.session.engine.hands.find(hand=>hand.number===handNumber&&hand.status==='complete');
+        if(!source)throw new Error('这手牌暂不可复盘');
+        const hand=structuredClone(source),shown=new Set(hand.shownPlayers??[]);
+        delete hand.finalPlayers;delete hand.memoryUpdates;delete hand.botPlans;delete hand.aiDecisions;delete hand.deck;delete hand.burned;
+        for(const result of hand.results??[]){const publicAtShowdown=hand.showdown===true&&!result.folded;if(result.playerId!==0&&!publicAtShowdown&&!shown.has(result.playerId)){result.hole=[];result.rank=null;}}
+        if(hand.showdown)for(const result of hand.results??[])if(result.rank&&!result.rank.cards)result.rank=bestFive([...hand.board,...result.hole]);
+        const players=(source.finalPlayers??this.session.engine.players).map(player=>this.publicOpponent({id:player.id,characterId:player.characterId,name:player.name,avatar:player.avatar,style:player.style}));
+        return {hand,players};
+      }
       if(name==='history'){
         const d=this.archive(url.searchParams.get('session')??'current'),h=d.hands.find(h=>h.number===Number(url.searchParams.get('hand'))),hand=h?structuredClone(h):null,replayPlayers=h?.finalPlayers??d.players;
         if(hand){delete hand.finalPlayers;delete hand.memoryUpdates;delete hand.botPlans;delete hand.aiDecisions;}

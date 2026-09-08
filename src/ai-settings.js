@@ -1,7 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const DEFAULT_AI_SETTINGS={mode:'local',baseUrl:'',model:'',timeoutSeconds:30};
+// External decisions have a fixed safety budget.  It is deliberately not a
+// player-facing tuning knob: a slow provider must never stall a live table.
+export const EXTERNAL_AI_TIMEOUT_SECONDS=20;
+// Calling an all-in is the only decision that may use the extended budget.
+// It is not user configurable, so a slow provider cannot stall ordinary turns.
+export const ALL_IN_AI_TIMEOUT_SECONDS=40;
+export const DEFAULT_AI_SETTINGS={mode:'local',baseUrl:'',model:'',timeoutSeconds:EXTERNAL_AI_TIMEOUT_SECONDS};
 export function completionEndpoint(value){
   let url;try{url=new URL(value);}catch{throw new Error('请填写完整的 API 地址');}
   if(url.username||url.password||url.search||url.hash)throw new Error('API 地址不能包含账号、密码、查询参数或片段');
@@ -20,10 +26,13 @@ export class AISettings {
     }
   }
   normalize(input){
-    const config={mode:input.mode??this.config.mode,baseUrl:String(input.baseUrl??this.config.baseUrl).trim(),model:String(input.model??this.config.model).trim(),timeoutSeconds:Number(input.timeoutSeconds??this.config.timeoutSeconds)};
+    const requestedTimeout=Number(input.timeoutSeconds??this.config.timeoutSeconds);
+    const config={mode:input.mode??this.config.mode,baseUrl:String(input.baseUrl??this.config.baseUrl).trim(),model:String(input.model??this.config.model).trim(),timeoutSeconds:EXTERNAL_AI_TIMEOUT_SECONDS};
     if(!['local','external'].includes(config.mode))throw new Error('请选择本地机器人或外部 AI');
     if(config.baseUrl.length>1000||config.model.length>160||/[\r\n]/.test(config.model))throw new Error('API 地址或模型名格式不正确');
-    if(!Number.isInteger(config.timeoutSeconds)||config.timeoutSeconds<5||config.timeoutSeconds>120)throw new Error('等待时间需为 5–120 秒');
+    // Accept legacy saved values while migrating every configuration to the
+    // fixed 20-second provider deadline.  Keep rejecting malformed input.
+    if(!Number.isFinite(requestedTimeout)||requestedTimeout<5||requestedTimeout>120)throw new Error('等待时间格式不正确');
     if(config.baseUrl)completionEndpoint(config.baseUrl);
     if(config.mode==='external'&&(!config.baseUrl||!config.model))throw new Error('外部 AI 需要 API 地址和模型名');
     return config;

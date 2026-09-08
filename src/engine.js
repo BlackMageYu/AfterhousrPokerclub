@@ -70,8 +70,11 @@ export class HoldemEngine {
   seatedIds() { return this.players.filter(p=>p.status!=='empty'&&p.status!=='busted').map(p=>p.id); }
   clockwise(after) {
     const ids=this.seatedIds();if(!ids.length)return [];
-    const index=ids.indexOf(after);if(index>=0)return ids.slice(index+1).concat(ids.slice(0,index+1));
-    return ids.filter(id=>id>after).concat(ids.filter(id=>id<=after));
+    // Seat ids are laid out from the hero at the bottom toward the right side
+    // of the table.  Moving to lower ids is therefore the physical clockwise
+    // direction seen by the player.
+    const index=ids.indexOf(after);if(index>=0)return ids.slice(0,index).reverse().concat(ids.slice(index+1).reverse(),ids[index]);
+    return ids.filter(id=>id<after).reverse().concat(ids.filter(id=>id>=after).reverse());
   }
   live() { return this.players.filter(p=>p.status!=='empty'&&p.status!=='busted'&&!p.folded); }
   actionable() { return this.live().filter(p=>!p.allIn); }

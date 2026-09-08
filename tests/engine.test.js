@@ -14,7 +14,7 @@ const make=(seats=2)=>new HoldemEngine({seats},{random:rng(123)});
 function finish(e) {let steps=0;while(e.active){if(++steps>200)throw new Error('Hand stalled');if(e.hand.actor==null)e.advance();else{const id=e.hand.actor,l=e.legal(id);e.act(id,l.canCheck?'check':'call');}}}
 function setTestStacks(e,stacks) {for(const [id,total] of Object.entries(stacks)){const p=e.players[id];p.stack=total-p.streetBet;p.totalBuyIn=total;p.allIn=p.stack===0;e.hand.initialStacks[id]=total;}}
 function deckFor(holes,board,burned=['2c','3c','4c']) {
-  const seats=holes.length,order=Array.from({length:seats},(_,i)=>(i+1)%seats),used=[];
+  const seats=holes.length,order=Array.from({length:seats},(_,i)=>(seats-3-i+seats*2)%seats),used=[];
   for(let i=0;i<2;i++)for(const id of order)used.push(holes[id][i]);
   used.push(burned[0],...board.slice(0,3),burned[1],board[3],burned[2],board[4]);
   assert.equal(new Set(used).size,used.length);return [...used,...newDeck().filter(c=>!used.includes(c))];
@@ -35,7 +35,7 @@ test('heads up button posts small blind and acts first preflop, last postflop',(
   finish(e);e.startHand();assert.equal(e.hand.button,1);assert.equal(e.hand.actor,1);
 });
 test('multiway first action, big blind option and three burn cards',()=>{
-  for(const seats of [3,5,7]){const e=make(seats);e.startHand();assert.equal(e.hand.actor,3%seats);finish(e);assert.equal(e.hand.board.length,5);assert.equal(e.hand.burned.length,3);assert.equal(e.hand.dealIndex,seats*2+8);assert.ok(e.hand.events.some(x=>x.playerId===e.hand.bb&&x.street==='preflop'&&x.action==='check'));}
+  for(const seats of [3,5,7]){const e=make(seats);e.startHand();assert.equal(e.hand.actor,(seats-5+seats)%seats);finish(e);assert.equal(e.hand.board.length,5);assert.equal(e.hand.burned.length,3);assert.equal(e.hand.dealIndex,seats*2+8);assert.ok(e.hand.events.some(x=>x.playerId===e.hand.bb&&x.street==='preflop'&&x.action==='check'));}
 });
 test('invalid action rejection is atomic',()=>{
   const e=make();e.startHand();const before=e.serialize();
@@ -49,24 +49,24 @@ test('three distinct stacks produce independently awarded main and side pots',()
   const e=make(3);
   e.startHand(deckFor([['As','Ah'],['Ks','Kh'],['Qs','Qh']],['2s','5d','7h','9c','Jd']));
   setTestStacks(e,{0:40,1:100,2:200});
-  e.act(0,'allin');e.act(1,'allin');e.act(2,'call');finish(e);
+  e.act(1,'allin');e.act(0,'allin');e.act(2,'call');finish(e);
   assert.deepEqual(e.hand.pots.map(p=>p.amount),[120,120]);assert.deepEqual(e.hand.pots.map(p=>p.awards[0].playerId),[0,1]);assert.deepEqual(e.players.map(p=>p.stack),[120,120,100]);
   assert.equal(e.players.reduce((n,p)=>n+p.stack,0),340);
 });
 test('equal board splits including odd chips clockwise after button',()=>{
   const e=make(3);e.startHand(deckFor([['2s','2h'],['3s','3h'],['4s','4h']],['As','Ks','Qs','Js','Ts'],['5c','6c','7c']));
-  e.act(0,'call');e.act(1,'fold');e.act(2,'check');finish(e);
-  assert.deepEqual(e.hand.pots[0].awards,[{playerId:2,amount:8},{playerId:0,amount:7}]);
-  assert.equal(e.players.reduce((sum,p)=>sum+p.stack,0),3000);assert.equal(e.hand.results[2].won,13);assert.equal(e.hand.results[0].won,12);
+  e.act(1,'fold');e.act(0,'call');e.act(2,'check');finish(e);
+  assert.deepEqual(e.hand.pots[0].awards,[{playerId:0,amount:10},{playerId:2,amount:10}]);
+  assert.equal(e.players.reduce((sum,p)=>sum+p.stack,0),3000);assert.equal(e.hand.results[0].won,10);assert.equal(e.hand.results[2].won,10);
 });
 test('short all-in does not reopen a full raise to a player who already acted',()=>{
-  const e=make(3);e.startHand();setTestStacks(e,{1:25});e.act(0,'raise',20);e.act(1,'allin');e.act(2,'call');assert.equal(e.hand.actor,0);assert.equal(e.legal(0).canRaise,false);assert.equal(e.legal(0).fullToCall,5);assert.throws(()=>e.act(0,'raise',100));e.act(0,'call');finish(e);
+  const e=make(3);e.startHand();setTestStacks(e,{0:25});e.act(1,'raise',20);e.act(0,'allin');e.act(2,'call');assert.equal(e.hand.actor,1);assert.equal(e.legal(1).canRaise,false);assert.equal(e.legal(1).fullToCall,5);assert.throws(()=>e.act(1,'raise',100));e.act(1,'call');finish(e);
 });
 test('cumulative short all-ins can reopen action after one full increment',()=>{
-  const e=make(5);e.startHand();setTestStacks(e,{4:25,0:30});e.act(3,'raise',20);e.act(4,'allin');e.act(0,'allin');e.act(1,'call');e.act(2,'call');assert.equal(e.hand.actor,3);assert.equal(e.legal(3).canRaise,true);assert.equal(e.legal(3).minRaiseTo,40);finish(e);
+  const e=make(5);e.startHand();setTestStacks(e,{4:25,3:30});e.act(0,'raise',20);e.act(4,'allin');e.act(3,'allin');e.act(2,'call');e.act(1,'call');assert.equal(e.hand.actor,0);assert.equal(e.legal(0).canRaise,true);assert.equal(e.legal(0).minRaiseTo,40);finish(e);
 });
 test('short opening all-in permits an earlier checker to complete to the minimum',()=>{
-  const e=make(3);e.startHand();setTestStacks(e,{2:15});e.act(0,'call');e.act(1,'call');e.act(2,'check');e.advance();e.act(1,'check');e.act(2,'allin');e.act(0,'call');assert.equal(e.hand.actor,1);assert.equal(e.legal(1).canRaise,true);assert.equal(e.legal(1).minRaiseTo,10);e.act(1,'raise',10);finish(e);
+  const e=make(3);e.startHand();setTestStacks(e,{2:15});e.act(1,'call');e.act(0,'call');e.act(2,'check');e.advance();e.act(0,'check');e.act(2,'allin');e.act(1,'call');assert.equal(e.hand.actor,0);assert.equal(e.legal(0).canRaise,true);assert.equal(e.legal(0).minRaiseTo,10);e.act(0,'raise',10);finish(e);
 });
 test('only non-all-in player cannot bet into an uncontested side pot',()=>{
   const e=make();e.players[0].stack=10;e.startHand();assert.equal(e.legal(0).canRaise,false);e.act(0,'call');assert.equal(e.hand.actor,null);finish(e);assert.equal(e.hand.events.filter(x=>x.type==='action').length,1);
@@ -107,7 +107,7 @@ test('local store keeps a bot action private until its one-to-ten second timer e
   }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 test('restored state resumes exactly, report includes each action and all dealt cards',()=>{
-  const e=make(3);e.startHand();e.act(0,'call');const partial=buildReport({id:'partial',engine:e,walletBefore:20000,wallet:19000});assert.equal(partial.json.accounting.heroProfit,0);assert.equal(partial.json.accounting.heroUnsettledCommitment,10);const restored=HoldemEngine.restore(e.serialize());assert.deepEqual(restored.view(),e.view());finish(restored);
+  const e=make(3);e.startHand();e.act(e.hand.actor,'call');e.act(e.hand.actor,'call');const partial=buildReport({id:'partial',engine:e,walletBefore:20000,wallet:19000});assert.equal(partial.json.accounting.heroProfit,0);assert.equal(partial.json.accounting.heroUnsettledCommitment,10);const restored=HoldemEngine.restore(e.serialize());assert.deepEqual(restored.view(),e.view());finish(restored);
   const report=buildReport({id:'test',engine:restored,walletBefore:20000,wallet:19000});assert.equal(report.json.hands.length,1);assert.equal(report.json.hands[0].deck.length,52);assert.ok(report.markdown.includes('烧牌'));assert.ok(report.markdown.includes('原始牌堆'));assert.ok(report.json.hands[0].events.every((x,i)=>x.seq===i));
 });
 test('1200 random hands across all table modes conserve every chip and always finish',()=>{
@@ -136,8 +136,8 @@ test('all seven bot profiles produce legal actions; distinct tight/loose and pas
   for(const style of Object.keys(STYLES)) {
     let entered=0,raised=0;
     for(let i=0;i<400;i++) {
-      const e=new HoldemEngine({seats:3,styles:[style,'TAG']},{random});e.startHand();e.act(0,'call');
-      const d=chooseBotAction(botObservation(e,1),random);if(d.action!=='fold')entered++;if(d.action==='raise')raised++;e.act(1,d.action,d.amount);
+      const e=new HoldemEngine({seats:3,styles:[style,'TAG']},{random});e.startHand();const actor=e.hand.actor;
+      const d=chooseBotAction(botObservation(e,actor),random);if(d.action!=='fold')entered++;if(d.action==='raise')raised++;e.act(actor,d.action,d.amount);
     }
     rates[style]={entered,raised};
   }
