@@ -1,8 +1,8 @@
 import {LOCAL_PROFILES,AI_PROFILES,permanentStyle,roleTraits,avatarDescriptor} from './character-profiles.js';
 import {legendCard} from './player-cards.js';
 
-// The ten original legendary human-player inspirations stay in the AI pool.
-// The former synthetic twenty-player pool is intentionally gone.
+// All identities belong to one club roster. The action engine selected for a
+// table is separate from the opponent's identity, portrait and play profile.
 const inspirations=[
  ['菲尔·艾维','Phil Ivey','职业牌手，高额现金桌人物原型。','冷静、观察细致，均衡价值与诈唬；依据公开行动寻找漏洞。'],
  ['道尔·布朗森','Doyle Brunson','老一代职业牌手与扑克作者人物原型。','老派进攻、经验导向；深筹码愿意缠斗，也懂得尊重强烈反击。'],
@@ -19,13 +19,14 @@ const legendRegions=['africa','europe','europe','europe','europe','europe','east
 
 const profileForPlay=profile=>({...profile,bio:profile.background,personality:profile.tagline+'；'+profile.pokerClues,avatar:avatarDescriptor(profile),level:profile.card?.level??.5,playerCard:profile.card});
 const sourceLocal=LOCAL_PROFILES.map(profile=>({...profileForPlay(profile),kind:'local'}));
-const sourceAI=AI_PROFILES.map(profile=>({...profileForPlay(profile),name:'[AI]'+profile.name,kind:'external'}));
+const sourceAI=AI_PROFILES.map(profile=>({...profileForPlay(profile),kind:'external'}));
 export const LOCAL_ROSTER=sourceLocal;
 export const AI_ROSTER=[
-  ...inspirations.map(([name,alias,bio,personality],i)=>{const characterId='legend-'+(i+1),style=['TAG','LAG','TAG','LAG','LAG','LAG','TAG','TAG','LAG','LAG'][i],playerCard=legendCard(style,1,bio+'；'+personality);return {characterId,name:'[AI]'+name,alias,bio,personality,avatar:`legend|${characterId}|${30+i}`,kind:'inspired',occupation:'职业牌手',age:45,gender:'男',nationality:legendRegions[i]==='east-asia'?'中国':legendRegions[i]==='africa'?'美国':'美国',ethnicity:legendRegions[i]==='africa'?'非裔':'白人',schedule:'工作 8 小时（12:00–20:00）｜打牌 4 小时（20:00–00:00）｜其余为休息',style,level:1,playerCard};}),
+  ...inspirations.map(([name,alias,bio,personality],i)=>{const characterId='legend-'+(i+1),style=['TAG','LAG','TAG','LAG','LAG','LAG','TAG','TAG','LAG','LAG'][i],playerCard=legendCard(style,1,bio+'；'+personality);return {characterId,name,alias,bio,personality,avatar:`legend|${characterId}|${30+i}`,kind:'inspired',occupation:'职业牌手',age:45,gender:'男',nationality:legendRegions[i]==='east-asia'?'中国':legendRegions[i]==='africa'?'美国':'美国',ethnicity:legendRegions[i]==='africa'?'非裔':'白人',schedule:'工作 8 小时（12:00–20:00）｜打牌 4 小时（20:00–00:00）｜其余为休息',style,level:1,playerCard};}),
   ...sourceAI
 ];
-export const ALL_ROSTER=[...LOCAL_ROSTER,...AI_ROSTER];
+export const CLUB_ROSTER=[...LOCAL_ROSTER,...AI_ROSTER];
+export const ALL_ROSTER=CLUB_ROSTER;
 
 // Every source character carries a permanent, story-derived card. Small hand
 // noise is still added later so a profile does not play identically every hand.
@@ -51,8 +52,8 @@ export function financialProfile(character){
   return {career,incomePerHour:Math.round(wage*variation),bankroll:Math.round(base*variation),skill:Math.round(level*1000)/1000,level:Math.round(level*1000)/1000};
 }
 
-export function drawCharacters(mode,count,random=Math.random,stakeLevel='low'){
-  const pool=[...(mode==='external'?AI_ROSTER:LOCAL_ROSTER)];
+export function drawCharacters(_mode,count,random=Math.random,stakeLevel='low'){
+  const pool=[...CLUB_ROSTER];
   if(!Number.isInteger(count)||count<1||count>6)throw new Error('无效的机器人数量');
   // High-level profiles are more likely to choose high-stakes tables. They
   // retain a non-zero low-stakes weight to model occasional recreational

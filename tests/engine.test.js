@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {HoldemEngine,PLAYER_ACTION_TIME_MS,ACTION_EXTENSION_MS} from '../src/engine.js';
 import {newDeck,evaluate} from '../src/cards.js';
-import {botObservation,chooseBotAction,chooseBotTiming} from '../src/bot.js';
+import {botObservation,chooseBotAction,chooseBotTiming,decisionContext,drawProfile,importantHandContext} from '../src/bot.js';
 import {GameStore} from '../src/store.js';
 import {STYLES} from '../src/styles.js';
 import {buildReport} from '../src/report.js';
@@ -45,6 +45,19 @@ test('invalid action rejection is atomic',()=>{
 test('unmatched bet returned on folds; winner only wins matched pot',()=>{
   const e=make();e.startHand();e.act(0,'raise',1000);e.act(1,'fold');assert.equal(e.active,false);assert.equal(e.players[0].stack,1010);assert.equal(e.players[1].stack,990);assert.equal(e.hand.pots[0].amount,20);assert.equal(e.hand.results[0].refunded,990);assert.equal(e.hand.results[0].net,10);
 });
+test('100BB pots become public important-hand records and affect later bot table-image context',()=>{
+  const e=make();e.startHand();
+  e.act(0,'raise',500);e.act(1,'call');e.advance();e.act(1,'raise',500);e.act(0,'fold');
+  assert.equal(e.hand.finalPot,1000);assert.equal(e.hand.importantHand.potBB,100);assert.equal(e.importantHands.length,1);assert.equal(e.hand.events.some(event=>event.type==='important'),true);
+  const record=e.importantHands[0];assert.equal(record.players.find(player=>player.playerId===1).aggressive,true);assert.equal(record.players.some(player=>Object.hasOwn(player,'hole')),false);
+  e.startHand();const observation=botObservation(e,1),image=importantHandContext(observation).byPlayer[1];
+  assert.equal(observation.importantHands[0].potBB,100);assert.ok(image.aggression>0&&image.wins>0);assert.equal(observation.importantHands[0].players.some(player=>Object.hasOwn(player,'hole')),false);
+  const report=buildReport({id:'important',engine:e,walletBefore:20000,wallet:19000});assert.equal(report.json.importantHands.length,1);assert.ok(report.markdown.includes('重要牌局（底池至少 100BB）'));
+});
+test('a folded hero retains only their own dimmable hole cards in the live view',()=>{
+  const e=make();e.startHand();const hole=[...e.players[0].hole];e.act(0,'fold');
+  const view=e.view();assert.equal(view.players[0].folded,true);assert.deepEqual(view.players[0].hole,hole);assert.deepEqual(view.players[1].hole,[]);
+});
 test('three distinct stacks produce independently awarded main and side pots',()=>{
   const e=make(3);
   e.startHand(deckFor([['As','Ah'],['Ks','Kh'],['Qs','Qh']],['2s','5d','7h','9c','Jd']));
@@ -73,6 +86,15 @@ test('only non-all-in player cannot bet into an uncontested side pot',()=>{
 });
 test('all-in undercall can call only own stack and uncalled remainder is returned',()=>{
   const e=make();e.players[0].stack=17;e.startHand();e.act(0,'call');e.act(1,'raise',100);assert.equal(e.legal(0).toCall,7);assert.equal(e.legal(0).eligiblePotAfterCall,34);e.act(0,'allin');finish(e);assert.equal(e.hand.pots[0].amount,34);assert.equal(e.hand.results[1].refunded,83);assert.equal(e.view().hand.pot,34);
+});
+test('every live all-in player exposes hole cards before the automatic runout',()=>{
+  const e=make();e.startHand(deckFor([['As','Ah'],['Ks','Kh']],['2s','5d','7h','9c','Jd']));setTestStacks(e,{0:30,1:30});
+  e.act(0,'allin');assert.equal(e.hand.allInShowdown,false);e.act(1,'allin');
+  assert.equal(e.hand.status,'playing');assert.equal(e.hand.street,'preflop');assert.equal(e.hand.actor,null);assert.equal(e.hand.allInShowdown,true);
+  assert.deepEqual(e.hand.shownPlayers,[0,1]);assert.equal(e.hand.events.at(-1).type,'show');assert.equal(e.hand.events.at(-1).allInShowdown,true);
+  const live=e.view();assert.deepEqual(live.players[1].hole,['Ks','Kh']);assert.equal(live.hand.showdown,false);assert.equal(live.hand.allInShowdown,true);assert.equal(live.hand.equities.length,2);assert.ok(Math.abs(live.hand.equities.reduce((sum,equity)=>sum+equity.percent,0)-100)<.01);
+  e.advance();assert.equal(e.hand.street,'flop');assert.equal(e.hand.board.length,3);assert.ok(e.hand.runoutNextAt>Date.now());assert.equal(e.view().hand.equities.length,2);
+  finish(e);assert.equal(e.hand.showdown,true);assert.equal(e.hand.results[1].hole.length,2);
 });
 test('topups only between hands and abort refunds without affecting stats',()=>{
   const e=make();e.startHand();e.act(0,'raise',50);assert.throws(()=>e.topUp(0,2000));e.abort();assert.deepEqual(e.players.map(p=>p.stack),[1000,1000]);assert.equal(e.players[0].stats.hands,0);assert.equal(e.hand.status,'aborted');assert.equal(e.topUp(0,1500),500);assert.equal(e.players[0].totalBuyIn,1500);assert.throws(()=>e.topUp(0,2500));assert.throws(()=>e.topUp(0,1000));
@@ -142,6 +164,22 @@ test('all seven bot profiles produce legal actions; distinct tight/loose and pas
     rates[style]={entered,raised};
   }
   assert.ok(rates.NIT.entered<rates.TAG.entered);assert.ok(rates.TAG.entered<rates.LAG.entered);assert.ok(rates.LAG.entered<rates.MANIAC.entered);assert.ok(rates.LP.raised<rates.LAG.raised);assert.ok(rates.TP.raised<rates.TAG.raised);
+});
+test('direct flush and straight draws use outs and pot odds instead of generic passive calls',()=>{
+  const direct={id:1,style:'TAG',level:.8,stack:900,streetBet:0,street:'flop',button:0,bb:10,pot:100,memory:{},actions:[{playerId:0,action:'raise',street:'flop'}],players:[{id:0,stack:900,folded:false,allIn:false,totalBet:100,stats:{hands:20,vpip:8,pfr:4}},{id:1,stack:900,folded:false,allIn:false,totalBet:0,stats:{hands:20,vpip:7,pfr:3}}],legal:{toCall:20,fullToCall:20,eligiblePotAfterCall:140,canCheck:false,canRaise:false,canAllIn:true,minRaiseTo:40,maxRaiseTo:900}};
+  const flush=drawProfile(['Ah','8h'],['Kh','4c','2h']);assert.equal(flush.flushOuts,9);assert.equal(flush.outs,9);assert.deepEqual(flush.kinds,['flush']);
+  assert.equal(chooseBotAction({...direct,hole:['Ah','8h'],board:['Kh','4c','2h']},()=>.99).action,'call');
+  const open=drawProfile(['9s','8d'],['7c','6h','Kd']);assert.equal(open.straightOuts,8);assert.ok(open.kinds.includes('open_ended_straight'));
+  assert.equal(chooseBotAction({...direct,hole:['9s','8d'],board:['7c','6h','Kd']},()=>.99).action,'call');
+  const gutshot=drawProfile(['9s','7d'],['8c','5h','Kd']);assert.equal(gutshot.straightOuts,4);assert.ok(gutshot.kinds.includes('gutshot'));
+  assert.equal(chooseBotAction({...direct,hole:['9s','7d'],board:['8c','5h','Kd'],pot:250,legal:{...direct.legal,toCall:10,fullToCall:10,eligiblePotAfterCall:270}},()=>.99).action,'call');
+  assert.equal(chooseBotAction({...direct,hole:['9s','7d'],board:['8c','5h','Kd'],pot:20,legal:{...direct.legal,toCall:60,fullToCall:60,eligiblePotAfterCall:80}},()=>.99).action,'fold');
+});
+test('bots use public stack depth, position, board texture and opponent rates for real cash-game choices',()=>{
+  const setMine={id:1,style:'TAG',level:.8,hole:['5s','5d'],stack:400,streetBet:0,board:[],street:'preflop',button:0,bb:10,pot:30,memory:{},actions:[{playerId:0,action:'raise',street:'preflop',raiseTo:20}],players:[{id:0,stack:400,folded:false,allIn:false,status:'active',stats:{hands:40,vpip:7,pfr:4}},{id:1,stack:400,folded:false,allIn:false,status:'active',stats:{hands:40,vpip:10,pfr:6}},{id:2,stack:400,folded:true,allIn:false,status:'active',stats:{hands:40,vpip:7,pfr:3}}],legal:{toCall:20,fullToCall:20,eligiblePotAfterCall:50,canCheck:false,canRaise:true,canAllIn:true,minRaiseTo:40,maxRaiseTo:400}};
+  const context=decisionContext(setMine);assert.equal(context.position.label,'cutoff');assert.equal(context.opponents.tight,true);assert.ok(context.spr>10);assert.equal(chooseBotAction(setMine,()=>.99).action,'call','deep stacks permit a priced small-pair set mine');
+  assert.equal(chooseBotAction({...setMine,stack:200,players:setMine.players.map(player=>({...player,stack:200}))},()=>.99).action,'fold','the same pair is not mined at shallow effective depth');
+  const post=decisionContext({...setMine,street:'flop',hole:['Ah','Qs'],board:['Kh','Jh','3c'],pot:80,actions:[]});assert.equal(post.texture.nutFlushBlocker,true);assert.equal(post.texture.broadwayBlockers,2);assert.equal(post.initiative,false);
 });
 test('complete bot games traverse all streets without illegal actions',()=>{
   const random=rng(876);

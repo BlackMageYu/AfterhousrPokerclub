@@ -28,7 +28,7 @@ export class AISettings {
   normalize(input){
     const requestedTimeout=Number(input.timeoutSeconds??this.config.timeoutSeconds);
     const config={mode:input.mode??this.config.mode,baseUrl:String(input.baseUrl??this.config.baseUrl).trim(),model:String(input.model??this.config.model).trim(),timeoutSeconds:EXTERNAL_AI_TIMEOUT_SECONDS};
-    if(!['local','external'].includes(config.mode))throw new Error('请选择本地机器人或外部 AI');
+    if(!['local','external'].includes(config.mode))throw new Error('请选择牌手决策引擎');
     if(config.baseUrl.length>1000||config.model.length>160||/[\r\n]/.test(config.model))throw new Error('API 地址或模型名格式不正确');
     // Accept legacy saved values while migrating every configuration to the
     // fixed 20-second provider deadline.  Keep rejecting malformed input.

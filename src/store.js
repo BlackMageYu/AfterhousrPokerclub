@@ -6,12 +6,12 @@ import {botObservation,chooseBotAction,chooseBotTiming} from './bot.js';
 import {bestFive} from './cards.js';
 import {STYLES,drawTableStyles} from './styles.js';
 import {buildReport} from './report.js';
-import {LOCAL_ROSTER,AI_ROSTER} from './roster.js';
+import {CLUB_ROSTER} from './roster.js';
 import {MusicLibrary} from './music.js';
 import {memorySummary} from './memory.js';
 import {visibleCharacter,registerEncounter,submitGuess,redactReport} from './discovery.js';
 import {createWorld,refreshWorld,publicWorld} from './world.js';
-import {mergeCareerStats,syncCareerStats,hydrateMemories,syncMemories,memoryFor} from './career.js';
+import {mergeCareerStats,normalizeStats,syncCareerStats,hydrateMemories,syncMemories,memoryFor} from './career.js';
 
 const secureRandom=()=>randomInt(0,0x100000000)/0x100000000;
 const normalizeDailyClaims=value=>{
@@ -59,7 +59,7 @@ export class GameStore {
     }
     this.refreshWorld();
     if(this.session?.expiresAt&&Date.now()>=new Date(this.session.expiresAt).getTime()&&!this.session.engine.active)this.end('房间时间到');
-    const session=this.session?{id:this.session.id,wallet:this.profile.wallet,durationMinutes:this.session.durationMinutes,expiresAt:this.session.expiresAt,...this.session.engine.view()}:null;if(session)session.players=session.players.map(p=>this.publicOpponent(p,this.session.id));const lastSummary=this.lastSummary?{...this.lastSummary,opponents:this.lastSummary.opponents.map(p=>this.publicOpponent(p,this.lastSummary.id))}:null;return structuredClone({app:'afterhours-poker',currency:'USD',profile:this.profile,styles:STYLES,rosterCounts:{local:LOCAL_ROSTER.length,external:AI_ROSTER.length},world:publicWorld(this.world),ai:{...this.ai,apiKey:undefined},session,lastSummary});}
+    const session=this.session?{id:this.session.id,wallet:this.profile.wallet,durationMinutes:this.session.durationMinutes,expiresAt:this.session.expiresAt,...this.session.engine.view()}:null;if(session)session.players=session.players.map(p=>this.publicOpponent(p,this.session.id));const lastSummary=this.lastSummary?{...this.lastSummary,opponents:this.lastSummary.opponents.map(p=>this.publicOpponent(p,this.lastSummary.id))}:null;const pokerStats=normalizeStats(this.careerStats.player??this.session?.engine.players?.[0]?.stats);return structuredClone({app:'afterhours-poker',currency:'USD',profile:{...this.profile,pokerStats},styles:STYLES,rosterCounts:{club:CLUB_ROSTER.length},world:publicWorld(this.world),ai:{...this.ai,apiKey:undefined},session,lastSummary});}
   checkTurn(body){
     if(!this.session||body?.sessionId!==this.session.id)throw new Error('场次已变化，请以当前牌桌为准');
     const h=this.session.engine.hand;
@@ -84,7 +84,12 @@ export class GameStore {
       this.finishHandFast(e,{fastAfterFold:true});
       this.session.wallet=this.profile.wallet;this.save();return this.state();
     }
-    if(h.actor===null){e.advance();this.session.wallet=this.profile.wallet;this.save();return this.state();}
+    if(h.actor===null){
+      // A normal all-in is deliberately paced for the table animation.  Fast
+      // folding and ending a table still use finishHandFast and skip this wait.
+      if(h.allInShowdown&&Number(h.runoutNextAt)>Date.now())return this.state();
+      e.advance();this.session.wallet=this.profile.wallet;this.save();return this.state();
+    }
     if(h.actor===0)throw new Error('尚未轮到电脑行动');
     const acting=e.players[h.actor];
     if(acting?.status==='sittingOut'){
@@ -143,16 +148,17 @@ export class GameStore {
     const url=new URL('/api/'+route,'poker://app'),name=url.pathname.slice(5);
     if(body===undefined){
       if(name==='music')return this.music.list();
-      if(name==='contacts')return {players:[...LOCAL_ROSTER,...AI_ROSTER].map(p=>this.publicOpponent(p,this.lastSummary?.id))};
+      if(name==='contacts')return {players:CLUB_ROSTER.map(p=>this.publicOpponent(p,this.lastSummary?.id))};
       if(name==='health')return {app:'afterhours-poker',root:this.root};
       if(name==='state')return this.state();
       if(name==='archives')return {sessions:fs.readdirSync(this.reportDir).filter(n=>/^poker-session-[\w-]+\.json$/.test(n)).sort().reverse().flatMap(n=>{try{const r=JSON.parse(fs.readFileSync(path.join(this.reportDir,n),'utf8'));return r.status==='ended'?[{id:r.sessionId,label:new Date(r.startedAt).toLocaleString('zh-CN',{hour12:false})+` / ${r.config.seats} 人桌`,hands:r.hands.filter(h=>h.status==='complete').length}]:[];}catch{return [];}})};
       if(name==='archive'){const d=this.archive(url.searchParams.get('session'));return {hands:d.hands.map(h=>({number:h.number,status:h.status,board:h.board,hole:h.results.find(r=>r.playerId===0)?.hole,net:h.results.find(r=>r.playerId===0)?.net??0,showdown:h.showdown}))};}
       if(name==='compact-history'){
         if(!this.session)throw new Error('请在牌局内打开本局复盘');
-        const handNumber=Number(url.searchParams.get('hand')),source=this.session.engine.hands.find(hand=>hand.number===handNumber&&hand.status==='complete');
+        const handNumber=Number(url.searchParams.get('hand')),current=this.session.engine.hand,source=this.session.engine.hands.find(hand=>hand.number===handNumber&&hand.status==='complete')??(current?.number===handNumber?current:null);
         if(!source)throw new Error('这手牌暂不可复盘');
-        const hand=structuredClone(source),shown=new Set(hand.shownPlayers??[]);
+        const hand=structuredClone(source),live=source===current&&source.status==='playing',shown=new Set(hand.shownPlayers??[]);
+        if(live){hand.compactLive=true;hand.finalPot=this.session.engine.pot();hand.results=this.session.engine.players.map(player=>({playerId:player.id,folded:!!player.folded,hole:player.id===0?[...player.hole]:[],rank:null,net:-Number(player.totalBet??0)}));}
         delete hand.finalPlayers;delete hand.memoryUpdates;delete hand.botPlans;delete hand.aiDecisions;delete hand.deck;delete hand.burned;
         for(const result of hand.results??[]){const publicAtShowdown=hand.showdown===true&&!result.folded;if(result.playerId!==0&&!publicAtShowdown&&!shown.has(result.playerId)){result.hole=[];result.rank=null;}}
         if(hand.showdown)for(const result of hand.results??[])if(result.rank&&!result.rank.cards)result.rank=bestFive([...hand.board,...result.hole]);
@@ -191,6 +197,10 @@ export class GameStore {
       this.profile.wallet+=amount;
       if(this.session){this.session.grants=(this.session.grants??0)+amount;this.session.wallet=this.profile.wallet;}this.save();return this.state();
     }
+    // A terminal leave may overtake a queued UI poll.  Both a duplicate leave
+    // and that stale poll should simply confirm the lobby state rather than
+    // leave the native client holding an already-closed table snapshot.
+    if(!this.session&&(name==='end'||name==='tick'))return this.state();
     if(!this.session)throw new Error('请先创建牌桌');
     if(body.sessionId!==this.session.id)throw new Error('场次已变化，请以当前牌桌为准');
     const e=this.session.engine;
@@ -203,7 +213,7 @@ export class GameStore {
     }
     else if(name==='extend')e.extendActionTime(0);
     else if(name==='timeout')e.expireAction(0);
-    else if(name==='tick'){if(e.active){if(e.hand.fastForwardBots){this.finishHandFast(e,{fastAfterFold:true});}else if(e.hand.actor===null)e.advance();else if(e.hand.actor!==0){if(e.config.controlMode==='local')return this.localBotTick(body);const decision=chooseBotAction(botObservation(e,e.hand.actor),this.random);return this.applyBotDecision(body,decision);}}}
+    else if(name==='tick'){if(e.active){if(e.hand.fastForwardBots){this.finishHandFast(e,{fastAfterFold:true});}else if(e.hand.actor===null){if(!(e.hand.allInShowdown&&Number(e.hand.runoutNextAt)>Date.now()))e.advance();}else if(e.hand.actor!==0){if(e.config.controlMode==='local')return this.localBotTick(body);const decision=chooseBotAction(botObservation(e,e.hand.actor),this.random);return this.applyBotDecision(body,decision);}}}
     else if(name==='next'){e.queuePlayerStraddle(body.playerStraddle===true);e.startHand();}
     else if(name==='show')e.showCards();
     else if(name==='rebuy'){const id=Number(body.playerId??0),target=Number(body.target),amount=target-(e.players[id]?.stack??0);if(id===0&&amount>this.profile.wallet)throw new Error('账户余额不足，请领取 300 美元');e.topUp(id,target);if(id===0)this.profile.wallet-=amount;}

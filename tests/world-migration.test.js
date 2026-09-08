@@ -38,6 +38,6 @@ test('desktop state request and restart accept an old world without losing accou
     assert.equal(state.profile.wallet,86034);assert.equal(state.profile.lifetimeHands,100);
     assert.equal(restored.discovery.characters['retired-test-1'].correct,1);
     assert.equal(restored.world.players['retired-test-1'].bankroll,999);
-    assert.equal(state.world.totalCount,state.rosterCounts.local+state.rosterCounts.external);
+    assert.equal(state.world.totalCount,state.rosterCounts.club);assert.equal(state.world.clubCount,state.rosterCounts.club);assert.ok(state.world.players.every(player=>player.pool==='club'));
   }
 });

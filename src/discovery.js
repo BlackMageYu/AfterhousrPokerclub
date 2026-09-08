@@ -1,6 +1,6 @@
-import {LOCAL_ROSTER,AI_ROSTER} from './roster.js';
+import {CLUB_ROSTER} from './roster.js';
 import {permanentStyle,dossier} from './character-profiles.js';
-const roster=[...LOCAL_ROSTER,...AI_ROSTER];
+const roster=CLUB_ROSTER;
 export const findCharacter=id=>roster.find(p=>p.characterId===id);
 export function progressFor(discovery,id){
  const saved=discovery?.characters&&Object.hasOwn(discovery.characters,id)?discovery.characters[id]:null;

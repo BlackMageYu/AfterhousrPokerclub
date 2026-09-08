@@ -19,6 +19,16 @@ AfterHours.pdb
 native-errors.log
 startup-error.txt
 
+# Local diagnostics utility (FFmpeg is installed here only for reference-video review)
+tools/
+
+# Recoverable card-deck backups and intermediate render passes
+assets/cards/faces-before-*/
+assets/cards/faces-from-style-masters/
+assets/cards/faces-flat-q/
+assets/cards/faces-master-rank-size/
+assets/cards/faces-transparent-edge/
+
 # Python bytecode cache
 __pycache__/
 *.py[cod]

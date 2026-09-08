@@ -27,6 +27,12 @@ test('an enabled straddle is chosen only occasionally by a qualifying bot and re
   assert.notEqual(e.hand.straddle,null);assert.notEqual(e.hand.straddle,0);assert.match(e.hand.straddleReason,/疯松|活跃牌局|社交娱乐/);
 });
 
+test('automatic straddle never skips an UTG hero for a later-position bot',()=>{
+  const e=new HoldemEngine({seats:7,stakeLevel:'low',buyBB:100,straddleEnabled:true,styles:['TAG','LAG','LP','TP','NIT','GRINDER']},{random:rng(0)});
+  e.button=4;e.startHand();
+  assert.equal(e.hand.bb,1);assert.equal(e.hand.straddle,null);assert.equal(e.hand.actor,0);
+});
+
 test('player straddle can be queued only between hands and is consumed on the next deal',()=>{
   const e=new HoldemEngine({seats:3,stakeLevel:'low',buyBB:100,straddleEnabled:true,styles:['TAG','LAG']},{random:rng(.99)});
   e.startHand();e.abort();assert.equal(e.queuePlayerStraddle(),true);e.startHand();
@@ -41,8 +47,9 @@ test('player timebank is one extension per hand',()=>{
 test('player voice gender and career memory persist in the desktop store',()=>{
   const root=tempRoot('poker-v3-career-');try{
     const store=new GameStore({root,random:rng(.5)});store.dispatch('profile-settings',{gender:'f'});const started=store.dispatch('start',{config:{seats:2,stakeLevel:'low',buyBB:50,durationMinutes:15}});
-    assert.equal(started.session.players[0].gender,'f');const bot=store.session.engine.players[1];bot.stats={hands:12,vpip:5,pfr:3,won:4,showdowns:6,maxWon:88};store.save();
-    const restored=new GameStore({root});assert.equal(restored.profile.gender,'f');assert.equal(restored.careerStats[bot.characterId].maxWon,88);assert.equal(restored.session.engine.players[1].stats.hands,12);
+    assert.equal(started.session.players[0].gender,'f');const hero=store.session.engine.players[0],bot=store.session.engine.players[1];hero.stats={hands:24,vpip:11,pfr:7,won:9,showdowns:8,maxWon:120};bot.stats={hands:12,vpip:5,pfr:3,won:4,showdowns:6,maxWon:88};store.save();
+    const visible=store.state();assert.deepEqual(visible.profile.pokerStats,{hands:24,vpip:11,pfr:7,won:9,showdowns:8,maxWon:120});
+    const restored=new GameStore({root});assert.equal(restored.profile.gender,'f');assert.equal(restored.careerStats[bot.characterId].maxWon,88);assert.equal(restored.session.engine.players[1].stats.hands,12);assert.deepEqual(restored.state().profile.pokerStats,{hands:24,vpip:11,pfr:7,won:9,showdowns:8,maxWon:120});
   }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 
@@ -60,6 +67,9 @@ test('new-table exit folds the player and preserves a completed hand',()=>{
     const store=new GameStore({root,random:rng(.5)}),started=store.dispatch('start',{config:{seats:2,stakeLevel:'low',buyBB:50,durationMinutes:15}});
     const ended=store.dispatch('end',{sessionId:started.session.id,reason:'测试强退'});
     assert.equal(ended.session,null);assert.ok(ended.lastSummary.completedHands>=1);
+    const stalePoll=store.dispatch('tick',{sessionId:started.session.id,handNumber:started.session.hand.number,eventCount:started.session.hand.eventCount});
+    const repeatedEnd=store.dispatch('end',{sessionId:started.session.id,reason:'重复强退'});
+    assert.equal(stalePoll.session,null);assert.equal(repeatedEnd.session,null);assert.equal(repeatedEnd.lastSummary.id,ended.lastSummary.id);
     const report=JSON.parse(fs.readFileSync(path.join(root,'日志',ended.lastSummary.reports.json),'utf8'));
     assert.ok(report.hands.length>=1);assert.ok(report.hands.every(hand=>hand.status==='complete'));assert.equal(report.config.stakeLevel,'low');
   }finally{fs.rmSync(root,{recursive:true,force:true});}

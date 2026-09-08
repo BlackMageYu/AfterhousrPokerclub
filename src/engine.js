@@ -2,12 +2,16 @@ import {newDeck, shuffle, evaluate, cardText,bestFive} from './cards.js';
 import {STYLES, DEFAULT_STYLES,createBotTraits,createHandPlan} from './styles.js';
 import {drawCharacters,financialProfile} from './roster.js';
 import {permanentStyle} from './character-profiles.js';
-import {observePublicHand,observeShownCards} from './memory.js';
+import {classifyExposure,observePublicHand,observeShownCards} from './memory.js';
 
 export const STREETS = ['preflop','flop','turn','river'];
 export const STREET_NAMES = {preflop:'翻牌前',flop:'翻牌',turn:'转牌',river:'河牌',showdown:'摊牌'};
 export const PLAYER_ACTION_TIME_MS = 20000;
 export const ACTION_EXTENSION_MS = 20000;
+export const IMPORTANT_POT_BB = 100;
+// The native table uses these pauses to let an all-in board breathe instead
+// of racing every remaining street through the next UI poll.
+export const ALL_IN_RUNOUT_DELAYS = Object.freeze({flop:3000,turn:5000});
 export const STAKE_LEVELS = Object.freeze([
   {id:'low',name:'低级场',sb:1,bb:2,straddle:4},
   {id:'mid',name:'中级场',sb:5,bb:10,straddle:20},
@@ -32,17 +36,18 @@ export class HoldemEngine {
       return {id,...(id===0?{name:'你',avatar:60,gender:config.playerGender==='f'?'f':'m'}:{...characters[id-1],...bot}),style:id===0?'HERO':styles[id-1],stack:id===0?bb*buyBB:buyIn,totalBuyIn:id===0?bb*buyBB:buyIn,stats:{hands:0,vpip:0,pfr:0,won:0,showdowns:0,maxWon:0},hole:[],streetBet:0,totalBet:0,folded:false,allIn:false,lastAction:'',actedAtBet:null,status:botBB>=50?'active':'empty',tilt:null,quitChance:0};
     });
     this.botTraits=Object.fromEntries(this.players.slice(1).map(p=>[p.id,createBotTraits(this.random,p.characterId)]));
-    this.hand=null; this.hands=[]; this.button=seats-1; this.movements=[];this.memories={}; this.playerStraddleNext=false; this.startedAt=new Date().toISOString(); this.endedAt=null;
+    this.hand=null; this.hands=[]; this.button=seats-1; this.movements=[];this.memories={};this.importantHands=[]; this.playerStraddleNext=false; this.startedAt=new Date().toISOString(); this.endedAt=null;
   }
   static restore(data) {
     const e=Object.create(HoldemEngine.prototype); Object.assign(e,data); e.random=Math.random;
     e.config.legacy??=[[5,10],[25,50],[50,100]].some(([sb,bb])=>sb===e.config.sb&&bb===e.config.bb);
     e.config.stakeLevel??=(e.config.legacy?'legacy':STAKE_LEVELS.find(x=>x.sb===e.config.sb&&x.bb===e.config.bb)?.id);
     e.config.straddle??=e.config.bb*2;e.config.straddleEnabled??=false;e.playerStraddleNext??=false;
+    e.importantHands=Array.isArray(e.importantHands)?e.importantHands.filter(hand=>Number(hand?.potBB)>=IMPORTANT_POT_BB).slice(-12):[];
     for(const p of e.players??[]){p.status??='active';p.tilt??=null;p.quitChance??=0;p.gender??='m';p.stats={hands:0,vpip:0,pfr:0,won:0,showdowns:0,maxWon:0,...p.stats};if(p.id){const profile=financialProfile(p);p.career??=profile.career;p.incomePerHour??=profile.incomePerHour;p.bankroll??=profile.bankroll;p.skill??=profile.skill;p.level??=profile.level;}}
     const h=e.hand;
     if(h?.status==='playing'){
-      h.actionExtensions??=0;h.botTiming??=null;h.botPendingDecision??=null;h.fastForwardBots??=false;h.actionStartedAt??=Date.now();
+      h.actionExtensions??=0;h.botTiming??=null;h.botPendingDecision??=null;h.fastForwardBots??=false;h.allInShowdown??=false;h.allInEquities??=[];h.runoutNextAt??=null;h.actionStartedAt??=Date.now();
       if(h.actor===0)h.actionDeadlineAt??=h.actionStartedAt+PLAYER_ACTION_TIME_MS;else h.actionDeadlineAt??=null;
     }
     return e;
@@ -89,9 +94,12 @@ export class HoldemEngine {
   }
   chooseStraddlePlayer(bb) {
     if(!this.config.straddleEnabled)return null;
-    const candidates=this.clockwise(bb).map(id=>this.players[id]).filter(p=>p&&p.id!==0&&p.status==='active'&&p.stack>=this.config.straddle);
-    if(!candidates.length)return null;
-    const player=candidates.find(p=>p.skill>=.68)||candidates[0],style=STYLES[player.style]??{};
+    // A live straddle is the blind immediately to the left of the big blind
+    // (UTG).  Picking a later seat, such as MP, makes UTG appear to act after
+    // the big blind and breaks the position labels shown to the player.
+    const utgId=this.clockwise(bb)[0],player=this.players[utgId];
+    if(!player||player.id===0||player.status!=='active'||player.stack<this.config.straddle)return null;
+    const style=STYLES[player.style]??{};
     const skill=Number(player.skill??.5),aggression=Number(style.aggression??.5),chance=Math.min(.30,.012+skill*.13+aggression*.045);
     if(this.random()>=chance)return null;
     const reasons=skill>=.78&&aggression>=.58
@@ -156,7 +164,7 @@ export class HoldemEngine {
     const deck=deckOverride ? [...deckOverride] : shuffle(newDeck(),this.random);
     if (deck.length!==52 || new Set(deck).size!==52 || deck.some(c=>!newDeck().includes(c))) throw new Error('牌堆必须包含完整的 52 张牌');
     const order=this.clockwise(this.button), headsUp=this.seatedIds().length===2, sb=headsUp?this.button:order[0],bb=headsUp?order[0]:order[1],playerStraddle=this.config.straddleEnabled&&this.playerStraddleNext&&this.players[0]?.status==='active'&&this.players[0].stack>=this.config.straddle;this.playerStraddleNext=false;const straddleChoice=playerStraddle?{id:0,reason:'玩家主动选择'}:this.chooseStraddlePlayer(bb),straddle=straddleChoice?.id??null;
-    const h=this.hand={number:this.hands.length+1,status:'playing',startedAt:new Date().toISOString(),button:this.button,sb,bb,straddle,straddleReason:straddleChoice?.reason??null,street:'preflop',board:[],burned:[],deck,dealIndex:0,initialStacks:this.players.map(p=>p.stack),events:[],pending:[],actor:null,currentBet:straddle===null?this.config.bb:this.config.straddle,lastFullRaise:this.config.bb,pots:[],results:[],vpip:[],pfr:[],actionStartedAt:null,actionDeadlineAt:null,actionExtensions:0,botTiming:null,botPendingDecision:null,fastForwardBots:false,entrants};
+    const h=this.hand={number:this.hands.length+1,status:'playing',startedAt:new Date().toISOString(),button:this.button,sb,bb,straddle,straddleReason:straddleChoice?.reason??null,street:'preflop',board:[],burned:[],deck,dealIndex:0,initialStacks:this.players.map(p=>p.stack),events:[],pending:[],actor:null,currentBet:straddle===null?this.config.bb:this.config.straddle,lastFullRaise:this.config.bb,pots:[],results:[],vpip:[],pfr:[],actionStartedAt:null,actionDeadlineAt:null,actionExtensions:0,botTiming:null,botPendingDecision:null,fastForwardBots:false,allInShowdown:false,allInEquities:[],runoutNextAt:null,entrants};
     h.botPlans=Object.fromEntries(this.players.filter(p=>p.id&&p.status!=='empty').map(p=>[p.id,createHandPlan(this.random)]));
     for (const p of this.players) {
       if (p.status==='empty') {
@@ -213,6 +221,34 @@ export class HoldemEngine {
     h.actionDeadlineAt=h.actor===0?h.actionStartedAt+PLAYER_ACTION_TIME_MS:null;
     h.actionExtensions=0;h.botTiming=null;h.botPendingDecision=null;
   }
+  revealAllInHands() {
+    const h=this.hand,contestants=this.live();
+    if(!this.active||h.allInShowdown||contestants.length<2||!contestants.every(player=>player.allIn))return false;
+    h.allInShowdown=true;
+    h.shownPlayers=[...new Set([...(h.shownPlayers??[]),...contestants.map(player=>player.id)])];
+    h.allInEquities=this.estimateAllInEquities();
+    this.record('show',{allInShowdown:true,playerIds:[...h.shownPlayers],text:'所有未弃牌玩家全下，立即亮牌'});
+    return true;
+  }
+  // Fair, deterministic Monte-Carlo equity.  Only the board and the exposed
+  // all-in hands are removed from the deck: folded hole cards remain unknown
+  // to the viewers and must not influence the displayed percentage.
+  estimateAllInEquities() {
+    const h=this.hand,contestants=this.live().filter(player=>player.hole?.length===2);
+    if(!h||contestants.length<2)return [];
+    const known=[...h.board,...contestants.flatMap(player=>player.hole)],available=newDeck().filter(card=>!known.includes(card)),needed=5-h.board.length;
+    if(needed<0||available.length<needed)return [];
+    let seed=2166136261;for(const value of [h.number,h.street,...known])for(const ch of String(value)){seed^=ch.charCodeAt(0);seed=Math.imul(seed,16777619)>>>0;}
+    const random=()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;};
+    const samples=contestants.length<=2?720:contestants.length<=4?600:480,shares=Array(contestants.length).fill(0);
+    for(let sample=0;sample<samples;sample++){
+      const runout=[...available];
+      for(let card=0;card<needed;card++){const pick=card+Math.floor(random()*(runout.length-card));[runout[card],runout[pick]]=[runout[pick],runout[card]];}
+      const board=[...h.board,...runout.slice(0,needed)],scores=contestants.map(player=>evaluate([...player.hole,...board]).score),best=Math.max(...scores),winners=scores.map((score,index)=>score===best?index:-1).filter(index=>index>=0);
+      for(const winner of winners)shares[winner]+=1/winners.length;
+    }
+    return contestants.map((player,index)=>({playerId:player.id,percent:Math.round(shares[index]*100000/samples)/1000,samples}));
+  }
   act(id,action,amount,meta={}) {
     const l=this.legal(id); if (!l) throw new Error('尚未轮到该玩家行动');
     if(id===0&&!meta.timedOut&&Number.isFinite(this.hand.actionDeadlineAt)&&Date.now()>=this.hand.actionDeadlineAt)throw new Error('你的行动时间已结束，请等待自动处理');
@@ -245,6 +281,7 @@ export class HoldemEngine {
       // computer actions immediately instead of showing theatrical think time.
       if (id===0&&action==='fold'&&this.live().length>=2)this.hand.fastForwardBots=true;
       this.selectActor(id);
+      this.revealAllInHands();
     }
     return this.view();
   }
@@ -258,7 +295,7 @@ export class HoldemEngine {
     h.pending=h.pending.filter(x=>x!==id);
     this.record('action',{playerId:id,action:'fold',voiceAction:'fold',amount:0,raiseTo:null,fullRaise:false,allIn:false,potBefore:this.pot(),toCallBefore:Math.max(0,h.currentBet-p.streetBet),fastFold:true,fastForward:true,text:`${p.name} 快速弃牌`});
     if(this.live().length===1)this.settle(false);
-    else {this.selectActor(id);h.fastForwardBots=true;}
+    else {this.selectActor(id);this.revealAllInHands();h.fastForwardBots=true;}
     return this.view();
   }
   expireAction(id=0,now=Date.now()) {
@@ -284,6 +321,11 @@ export class HoldemEngine {
     h.street=STREETS[STREETS.indexOf(h.street)+1];
     const burned=this.draw();h.burned.push(burned);
     const cards=Array.from({length:h.street==='flop'?3:1},()=>this.draw());h.board.push(...cards);
+    if(h.allInShowdown){
+      h.allInEquities=this.estimateAllInEquities();
+      const delay=ALL_IN_RUNOUT_DELAYS[h.street]??0;
+      h.runoutNextAt=delay?Date.now()+delay:null;
+    }
     this.record('board',{cards,burned,text:`${STREET_NAMES[h.street]} · ${cards.map(cardText).join(' ')}`});
     h.pending=this.actionable().length>=2?this.actionable().map(p=>p.id):[];
     this.selectActor(this.button);
@@ -314,11 +356,47 @@ export class HoldemEngine {
     h.results=this.players.map(p=>({playerId:p.id,hole:[...p.hole],folded:p.folded,invested:p.totalBet,won:won[p.id],refunded:refunded[p.id],net:p.stack-h.initialStacks[p.id]-(h.stackAdjustments?.[p.id]??0),stack:p.stack,rank:showdown&&!p.folded?bestFive([...h.board,...p.hole]):null}));
     for (const p of this.players) {p.stats.hands++;if(h.vpip.includes(p.id))p.stats.vpip++;if(h.pfr.includes(p.id))p.stats.pfr++;if(won[p.id]>0)p.stats.won++;if(showdown&&!p.folded)p.stats.showdowns++;p.stats.maxWon=Math.max(p.stats.maxWon??0,won[p.id]);}
     h.winnerText=h.results.filter(r=>r.won>0).map(r=>`${this.players[r.playerId].name} 赢得 ${r.won}${r.rank?' · '+r.rank.name:''}`).join(' / ');
+    this.markImportantHand();
+    this.maybeBotVoluntaryShow();
     this.record('result',{text:h.winnerText,pots:copy(h.pots),results:copy(h.results)});
     observePublicHand(this);
     if(!this.config.legacy)this.applyPsychology(showdown);
     if(!this.config.legacy)this.applyBotLifecycle();
     h.finalPlayers=copy(this.players);this.hands.push(copy(h));
+  }
+  markImportantHand() {
+    const h=this.hand,potBB=h.finalPot/Math.max(1,this.config.bb);
+    if(!Number.isFinite(potBB)||potBB<IMPORTANT_POT_BB)return null;
+    const record={handNumber:h.number,pot:h.finalPot,potBB:Number(potBB.toFixed(1)),showdown:h.showdown===true,players:h.results.filter(result=>result.invested>0||result.won>0).map(result=>({playerId:result.playerId,won:result.won>0,aggressive:h.events.some(event=>event.type==='action'&&event.playerId===result.playerId&&event.action==='raise'),allIn:h.events.some(event=>event.type==='action'&&event.playerId===result.playerId&&event.allIn),voluntaryShow:false,showTag:null}))};
+    h.importantHand=copy(record);this.importantHands??=[];this.importantHands.push(copy(record));if(this.importantHands.length>12)this.importantHands.splice(0,this.importantHands.length-12);
+    this.record('important',{important:copy(record),text:`重要牌局 · 底池 ${h.finalPot}（${record.potBB} BB）`});
+    return record;
+  }
+  updateImportantShow(playerId,showTag) {
+    const update=record=>{const player=record?.players?.find(entry=>entry.playerId===playerId);if(player){player.voluntaryShow=true;player.showTag=showTag??'neutral';}};
+    update(this.hand?.importantHand);update(this.importantHands?.find(record=>record.handNumber===this.hand?.number));
+  }
+  voluntaryShow(id,reason='主动秀牌') {
+    const h=this.hand,p=this.players[id];
+    if(!h||h.status!=='complete'||!p||h.shownPlayers?.includes(id)||p.hole.length!==2)throw new Error('这位玩家本手不能亮牌');
+    const evidence=classifyExposure(p.hole,h.events.filter(event=>event.type==='action'&&event.playerId===id)),showTag=evidence?.kind??'neutral';
+    h.shownPlayers.push(id);this.updateImportantShow(id,showTag);
+    this.record('show',{playerId:id,cards:[...p.hole],voluntary:true,imagePlay:reason,showTag,text:`${p.name} 主动秀牌：${p.hole.map(cardText).join(' ')}（${reason}）`});
+    observeShownCards(this,id,'voluntary');return true;
+  }
+  maybeBotVoluntaryShow() {
+    const h=this.hand;
+    // Voluntary exposure is deliberately scarce: at most one such image play
+    // per fifteen completed hands, and only after a contested important pot.
+    if(!h?.importantHand||h.showdown||h.shownPlayers?.length)return false;
+    const earlier=this.hands.filter(hand=>hand.status==='complete').length,shown=(this.importantHands??[]).flatMap(hand=>hand.players??[]).filter(player=>player.voluntaryShow).length;
+    if(shown>=Math.max(1,Math.floor((earlier+1)/15)))return false;
+    const candidates=h.results.filter(result=>result.playerId>0&&result.won>0&&this.players[result.playerId]?.hole.length===2&&h.events.some(event=>event.type==='action'&&event.playerId===result.playerId&&event.action==='raise'));
+    if(!candidates.length)return false;
+    const result=candidates[Math.floor(this.random()*candidates.length)],player=this.players[result.playerId],evidence=classifyExposure(player.hole,h.events.filter(event=>event.type==='action'&&event.playerId===player.id)),style=STYLES[player.style]??{};
+    const chance=Math.min(.05,.012+(h.importantHand.potBB>=150?.008:0)+(Number(style.aggression??.5)-.5)*.018+(evidence&&['air_bluff','draw_bluff','wide_open'].includes(evidence.kind)?.010:0)+(evidence?.kind==='value'?.006:0));
+    if(this.random()>=chance)return false;
+    return this.voluntaryShow(player.id,evidence&&['air_bluff','draw_bluff','wide_open'].includes(evidence.kind)?'塑造宽范围形象':'塑造价值形象');
   }
   applyPsychology(showdown) {
     const h=this.hand;if(!showdown||h.board.length!==5||!h.events.some(e=>e.type==='action'&&e.allIn))return;
@@ -361,9 +439,7 @@ export class HoldemEngine {
     h.shownPlayers??=h.showdown?this.live().map(p=>p.id):[];
     if(h.shownPlayers.includes(id))throw new Error('这位玩家本手已经亮牌');
     if(id!==0)throw new Error('只能主动亮出自己的底牌');
-    h.shownPlayers.push(id);
-    this.record('show',{playerId:id,cards:[...this.players[id].hole],text:`${this.players[id].name} 主动秀牌：${this.players[id].hole.map(cardText).join(' ')}（全桌可见）`});
-    observeShownCards(this,id);
+    this.voluntaryShow(id,'主动亮牌');
     this.hands[this.hands.length-1]=copy(h);
     return this.view();
   }
@@ -382,7 +458,7 @@ export class HoldemEngine {
     if(h?.showdown)for(const r of h.results)if(r.rank&&!r.rank.cards)r.rank=bestFive([...h.board,...r.hole]);
     return {config:revealStyles?this.config:publicConfig,startedAt:this.startedAt,endedAt:this.endedAt,completedHands:this.hands.filter(x=>x.status==='complete').length,
       players:this.players.map(p=>{const safe=copy(p);delete safe.bankroll;delete safe.incomePerHour;delete safe.skill;delete safe.tilt;delete safe.quitChance;return {...safe,style:p.id===0?'HERO':revealStyles?p.style:'UNKNOWN',actedAtBet:undefined,hole:p.id===0||(h?.showdown&&!p.folded)||h?.shownPlayers?.includes(p.id)?p.hole:[]};}),
-      hand:h?{number:h.number,eventCount:h.events.length,status:h.status,showdown:h.showdown===true,button:h.button,sb:h.sb,bb:h.bb,straddle:h.straddle===null?null:h.straddle,straddleReason:h.straddleReason??null,street:h.street,board:[...h.board],pending:[...(h.pending??[])],actor:h.actor,pot:this.pot(),currentBet:h.currentBet,legal:this.legal(0),actionStartedAt:h.actionStartedAt??null,actionDeadlineAt:h.actionDeadlineAt??null,actionExtensions:h.actionExtensions??0,actionTimeLimitMs:h.actor===0?PLAYER_ACTION_TIME_MS:null,botTiming:h.botTiming?{playerId:h.botTiming.playerId,startedAt:h.botTiming.startedAt,dueAt:h.botTiming.dueAt,kind:h.botTiming.kind}:null,winnerText:h.winnerText,canShow:h.status==='complete'&&!h.shownPlayers?.includes(0)&&!(h.showdown&&!this.players[0].folded),shownPlayers:h.shownPlayers??[],pots:copy(h.pots),results:h.status!=='playing'?copy(h.results).map(r=>({...r,hole:r.playerId===0||(h.showdown&&!r.folded)?r.hole:[]})):[],events:h.events.filter(e=>['action','blind','board','result','refund','show','timebank'].includes(e.type)).map(e=>({seq:e.seq,street:e.street,text:e.text,type:e.type,playerId:e.playerId,action:e.action,voiceAction:e.voiceAction,amount:e.amount,allIn:e.allIn,potBefore:e.potBefore,thinkTimeMs:e.thinkTimeMs,fastFold:e.fastFold===true,fastForward:e.fastForward===true,extensions:e.extensions}))}:null,
-      history:this.hands.map(x=>({number:x.number,status:x.status,board:x.board,hole:x.results.find(r=>r.playerId===0)?.hole,net:x.results.find(r=>r.playerId===0)?.net??0,winnerText:x.winnerText,showdown:x.showdown}))};
+      hand:h?{number:h.number,eventCount:h.events.length,status:h.status,showdown:h.showdown===true,allInShowdown:h.allInShowdown===true,equities:copy(h.allInEquities??[]),runoutNextAt:h.runoutNextAt??null,button:h.button,sb:h.sb,bb:h.bb,straddle:h.straddle===null?null:h.straddle,straddleReason:h.straddleReason??null,street:h.street,board:[...h.board],pending:[...(h.pending??[])],actor:h.actor,pot:this.pot(),currentBet:h.currentBet,legal:this.legal(0),actionStartedAt:h.actionStartedAt??null,actionDeadlineAt:h.actionDeadlineAt??null,actionExtensions:h.actionExtensions??0,actionTimeLimitMs:h.actor===0?PLAYER_ACTION_TIME_MS:null,botTiming:h.botTiming?{playerId:h.botTiming.playerId,startedAt:h.botTiming.startedAt,dueAt:h.botTiming.dueAt,kind:h.botTiming.kind}:null,winnerText:h.winnerText,importantHand:copy(h.importantHand??null),canShow:h.status==='complete'&&!h.shownPlayers?.includes(0)&&!(h.showdown&&!this.players[0].folded),shownPlayers:h.shownPlayers??[],pots:copy(h.pots),results:h.status!=='playing'?copy(h.results).map(r=>({...r,hole:r.playerId===0||(h.showdown&&!r.folded)||h.shownPlayers?.includes(r.playerId)?r.hole:[]})):[],events:h.events.filter(e=>['action','blind','board','important','result','refund','show','timebank'].includes(e.type)).map(e=>({seq:e.seq,street:e.street,text:e.text,type:e.type,playerId:e.playerId,action:e.action,voiceAction:e.voiceAction,amount:e.amount,allIn:e.allIn,potBefore:e.potBefore,thinkTimeMs:e.thinkTimeMs,fastFold:e.fastFold===true,fastForward:e.fastForward===true,allInShowdown:e.allInShowdown===true,extensions:e.extensions}))}:null,
+      importantHands:copy(this.importantHands??[]),history:this.hands.map(x=>({number:x.number,status:x.status,board:x.board,hole:x.results.find(r=>r.playerId===0)?.hole,net:x.results.find(r=>r.playerId===0)?.net??0,winnerText:x.winnerText,showdown:x.showdown,importantHand:copy(x.importantHand??null)}))};
   }
 }

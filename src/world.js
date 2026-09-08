@@ -1,8 +1,8 @@
-import {LOCAL_ROSTER,AI_ROSTER,financialProfile} from './roster.js';
+import {CLUB_ROSTER,financialProfile} from './roster.js';
 import {parseDailySchedule,scheduledActivity} from './schedules.js';
 
 export const WORLD_DAY_MS=24*60*60*1000;
-const roster=[...LOCAL_ROSTER,...AI_ROSTER];
+const roster=CLUB_ROSTER;
 const rosterById=new Map(roster.map(character=>[character.characterId,character]));
 const dayKey=now=>new Date(now).toLocaleDateString('sv-SE');
 const clamp=(n,lo,hi)=>Math.max(lo,Math.min(hi,n));
@@ -15,14 +15,14 @@ function characterData(characterId){
 }
 function newWorldPlayer(character,now,date){
   const money=financialProfile(character),schedule=character.schedule??defaultLegendSchedule;
-  return {characterId:character.characterId,name:character.name,career:character.occupation??money.career,schedule,windows:parseDailySchedule(schedule),pool:character.kind==='inspired'||character.kind==='external'?'ai':'local',level:Number(character.level??character.playerCard?.level??money.level??.5),bankroll:money.bankroll,incomePerHour:money.incomePerHour,activity:'rest',online:false,activityStartedAt:now,lastUpdated:now,dailyDate:date,workMinutes:0,playMinutes:0,playHands:0,earnings:0,targetWorkMinutes:null};
+  return {characterId:character.characterId,name:character.name,career:character.occupation??money.career,schedule,windows:parseDailySchedule(schedule),pool:'club',level:Number(character.level??character.playerCard?.level??money.level??.5),bankroll:money.bankroll,incomePerHour:money.incomePerHour,activity:'rest',online:false,activityStartedAt:now,lastUpdated:now,dailyDate:date,workMinutes:0,playMinutes:0,playHands:0,earnings:0,targetWorkMinutes:null};
 }
 function applyCharacterData(player){
   const character=characterData(player.characterId);if(!character)return player;
   const money=financialProfile(character);
   player.name??=character.name;player.career??=character.occupation??money.career;
   player.schedule??=character.schedule;player.windows??=parseDailySchedule(player.schedule);
-  player.pool??=(character.kind==='inspired'||character.kind==='external'?'ai':'local');
+  player.pool='club';
   player.level??=Number(character.level??character.playerCard?.level??money.level??.5);
   player.incomePerHour??=money.incomePerHour;player.bankroll??=money.bankroll;
   return player;
@@ -31,7 +31,7 @@ function applyCharacterData(player){
 export function createWorld(now=Date.now()) {
   const date=dayKey(now),players={};
   for(const character of roster)players[character.characterId]=newWorldPlayer(character,now,date);
-  return {schemaVersion:2,lastUpdated:now,dailyDate:date,players,refreshIntervalMs:1800000};
+  return {schemaVersion:3,lastUpdated:now,dailyDate:date,players,refreshIntervalMs:1800000};
 }
 
 function resetDay(p,date){
@@ -41,7 +41,7 @@ function resetDay(p,date){
 export function refreshWorld(world,now=Date.now(),random=Math.random) {
   world??=createWorld(now);world.players??={};const date=dayKey(now);
   for(const character of roster)if(!world.players[character.characterId])world.players[character.characterId]=newWorldPlayer(character,now,date);
-  world.schemaVersion=2;
+  world.schemaVersion=3;
   if(world.dailyDate!==date){world.dailyDate=date;for(const p of Object.values(world.players))resetDay(p,date);}
   const last=Number.isFinite(Number(world.lastUpdated))?Number(world.lastUpdated):now;
   const elapsed=clamp((now-last)/60000,0,1440);
@@ -64,6 +64,6 @@ export function refreshWorld(world,now=Date.now(),random=Math.random) {
 }
 
 export function publicWorld(world){
-  const rows=Object.values(world.players).filter(p=>rosterById.has(p.characterId)),online=rows.filter(p=>p.online),local=rows.filter(p=>p.pool==='local'),ai=rows.filter(p=>p.pool!=='local');
-  return {date:world.dailyDate,updatedAt:world.lastUpdated,refreshIntervalMs:world.refreshIntervalMs??1800000,totalCount:rows.length,onlineCount:online.length,localCount:local.length,aiCount:ai.length,localOnlineCount:local.filter(p=>p.online).length,aiOnlineCount:ai.filter(p=>p.online).length,players:rows.map(p=>({characterId:p.characterId,name:p.name,career:p.career,pool:p.pool,level:Number(p.level??.5),online:!!p.online,activity:p.busted?'资金耗尽':activityLabel[p.activity]??'休息中',status:p.online?'在线':'离线',statusDetail:p.busted?'资金耗尽':activityLabel[p.activity]??'休息中',workMinutes:Math.round(p.workMinutes),playMinutes:Math.round(p.playMinutes),playHands:p.playHands,earnings:Math.round(p.earnings)}))};
+  const rows=Object.values(world.players).filter(p=>rosterById.has(p.characterId)),online=rows.filter(p=>p.online);
+  return {date:world.dailyDate,updatedAt:world.lastUpdated,refreshIntervalMs:world.refreshIntervalMs??1800000,totalCount:rows.length,onlineCount:online.length,clubCount:rows.length,clubOnlineCount:online.length,players:rows.map(p=>({characterId:p.characterId,name:p.name,career:p.career,pool:'club',level:Number(p.level??.5),online:!!p.online,activity:p.busted?'资金耗尽':activityLabel[p.activity]??'休息中',status:p.online?'在线':'离线',statusDetail:p.busted?'资金耗尽':activityLabel[p.activity]??'休息中',workMinutes:Math.round(p.workMinutes),playMinutes:Math.round(p.playMinutes),playHands:p.playHands,earnings:Math.round(p.earnings)}))};
 }

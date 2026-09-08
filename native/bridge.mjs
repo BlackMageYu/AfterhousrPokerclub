@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {GameStore} from '../src/store.js';
 import {AISettings} from '../src/ai-settings.js';
 import {AIGameService} from '../src/external-ai.js';
-import {LOCAL_ROSTER,AI_ROSTER} from '../src/roster.js';
+import {CLUB_ROSTER} from '../src/roster.js';
 import {mergeCareerStats} from '../src/career.js';
 const root=process.argv[2]||process.env.AFTERHOURS_DATA_ROOT||path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const store=new GameStore({root});
@@ -20,17 +20,17 @@ async function dispatch(command,body){
   if(body===null)body=undefined;
   if(command==='shutdown'){service.cancel();store.save();return {closed:true};}
   if(command==='pause'){
-    if(store.session?.engine.active){const h=store.session.engine.hand;const next=body.paused===true;if(next&&!h.nativePaused)h.nativePausedAt=Date.now();if(!next&&h.nativePaused){const elapsed=Math.max(0,Date.now()-(h.nativePausedAt||Date.now()));if(h.actionDeadlineAt)h.actionDeadlineAt+=elapsed;if(h.actionStartedAt)h.actionStartedAt+=elapsed;if(h.botTiming){h.botTiming.startedAt+=elapsed;h.botTiming.dueAt+=elapsed;}}h.nativePaused=next;store.save();}
+    if(store.session?.engine.active){const h=store.session.engine.hand;const next=body.paused===true;if(next&&!h.nativePaused)h.nativePausedAt=Date.now();if(!next&&h.nativePaused){const elapsed=Math.max(0,Date.now()-(h.nativePausedAt||Date.now()));if(h.actionDeadlineAt)h.actionDeadlineAt+=elapsed;if(h.actionStartedAt)h.actionStartedAt+=elapsed;if(h.runoutNextAt)h.runoutNextAt+=elapsed;if(h.botTiming){h.botTiming.startedAt+=elapsed;h.botTiming.dueAt+=elapsed;}}h.nativePaused=next;store.save();}
     return service.state();
   }
   if(command==='key-init'){settings.key=String(body.key||'');return {ok:true};}
   if(command==='ai-settings'&&body){settings.nativeCipher=body.encryptedKey??settings.encryptedKey;}
   if(command==='mark'){
-    if(![...LOCAL_ROSTER,...AI_ROSTER].some(p=>p.characterId===body.characterId))throw new Error('未知牌友');
+    if(!CLUB_ROSTER.some(p=>p.characterId===body.characterId))throw new Error('未知牌友');
     store.profile.marks??={};store.profile.marks[body.characterId]=String(body.mark||'').slice(0,100);store.save();return service.state();
   }
   if(command==='contacts'){
-    return {players:[...LOCAL_ROSTER,...AI_ROSTER].map(p=>{const copy=structuredClone(p);mergeCareerStats(copy,store.careerStats);return store.publicOpponent(copy,store.lastSummary?.id);})};
+    return {players:CLUB_ROSTER.map(p=>{const copy=structuredClone(p);mergeCareerStats(copy,store.careerStats);return store.publicOpponent(copy,store.lastSummary?.id);})};
   }
   if(command==='history'&&store.session)throw new Error('详细回放仅可在大厅打开');
   if(!commands.has(command.split('?')[0]))throw new Error('未知程序命令');

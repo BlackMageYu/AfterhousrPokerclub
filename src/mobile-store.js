@@ -3,11 +3,11 @@ import {botObservation,chooseBotAction,chooseBotTiming} from './bot.js';
 import {bestFive} from './cards.js';
 import {STYLES} from './styles.js';
 import {buildReport} from './report.js';
-import {LOCAL_ROSTER,AI_ROSTER} from './roster.js';
+import {CLUB_ROSTER} from './roster.js';
 import {memorySummary} from './memory.js';
 import {visibleCharacter,registerEncounter,submitGuess} from './discovery.js';
 import {createWorld,refreshWorld,publicWorld} from './world.js';
-import {mergeCareerStats,syncCareerStats,hydrateMemories,syncMemories,memoryFor} from './career.js';
+import {mergeCareerStats,normalizeStats,syncCareerStats,hydrateMemories,syncMemories,memoryFor} from './career.js';
 
 // The Android build has no Node.js filesystem.  This store keeps the same
 // route contract as the desktop GameStore, while persisting JSON in the
@@ -26,8 +26,14 @@ const MUSIC_FILES=[
 const AI_PROTOCOL='afterhours-decision/1';
 const EXTERNAL_AI_TIMEOUT_SECONDS=20;
 const BOT_ACTION_WINDOW_MS=20000;
+const INVALID_RESPONSE_LOG_LIMIT=12000;
 const AI_SYSTEM_PROMPT='You control one opponent in a no-limit Texas Hold\'em practice game. Decide using only the supplied observation: your own hole cards, public actions, public board and memories of openly shown cards. Other players\' hidden cards and future cards are unknown. Keep the assigned style as a tendency, mix actions naturally, and return ONLY one JSON object: {"action":"fold|check|call|raise|allin","raiseTo":integer}. raiseTo is the total committed on this betting street.';
 const clone=value=>structuredClone(value);
+const invalidMobileResponseDiagnostic=(content,apiKey='')=>{
+  const raw=String(content??''),key=typeof apiKey==='string'?apiKey:'';let safe=key?raw.split(key).join('[REDACTED]'):raw;
+  safe=safe.replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi,'Bearer [REDACTED]').replace(/(\b(?:api[_-]?key|authorization|token|secret)\b\s*[:=]\s*["']?)([^\s"',}\]]+)/gi,'$1[REDACTED]').replace(/\u0000/g,'\\u0000');
+  return {content:safe.slice(0,INVALID_RESPONSE_LOG_LIMIT),originalLength:raw.length,truncated:safe.length>INVALID_RESPONSE_LOG_LIMIT,redacted:safe!==raw};
+};
 const normalizeDailyClaims=value=>{
   const source=value&&typeof value==='object'?value:{};
   const legacyBust=source.bust===true?1:Number(source.bust);
@@ -53,7 +59,7 @@ async function requestMobileAI(config,observation,{signal}={}){
     if(!response.ok)throw new Error(`AI 请求失败（${response.status}）`);
     const text=await response.text();if(text.length>262144)throw new Error('AI 返回内容过大');
     const body=JSON.parse(text),content=body?.choices?.[0]?.message?.content;if(typeof content!=='string')throw new Error('AI 未返回可用的决策 JSON');
-    const clean=content.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');return {decision:validateMobileDecision(JSON.parse(clean),observation),elapsedMs:Date.now()-started,usage:body.usage??{}};
+    const clean=content.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');let value;try{value=JSON.parse(clean);}catch{throw Object.assign(new Error('AI 返回格式不是决策 JSON'),{code:'invalid_response',responseDiagnostic:invalidMobileResponseDiagnostic(content,config.apiKey)});}return {decision:validateMobileDecision(value,observation),elapsedMs:Date.now()-started,usage:body.usage??{}};
   }catch(error){if(signal?.aborted)throw Object.assign(new Error('外部 AI 请求已取消'),{code:'cancelled'});if(error?.name==='AbortError')throw Object.assign(new Error('外部 AI 等待超时'),{code:'timeout'});throw error;}finally{clearTimeout(timeout);signal?.removeEventListener('abort',abort);}
 }
 
@@ -103,7 +109,8 @@ export class MobileGameStore {
     const session=this.session?{id:this.session.id,wallet:this.profile.wallet,durationMinutes:this.session.durationMinutes,expiresAt:this.session.expiresAt,...this.session.engine.view()}:null;
     if(session)session.players=session.players.map(p=>this.publicOpponent(p,this.session.id));
     const lastSummary=this.lastSummary?{...this.lastSummary,opponents:this.lastSummary.opponents.map(p=>this.publicOpponent(p,this.lastSummary.id))}:null;
-    return clone({app:'afterhours-poker',currency:'USD',profile:this.profile,styles:STYLES,rosterCounts:{local:LOCAL_ROSTER.length,external:AI_ROSTER.length},world:publicWorld(this.world),ai:{...this.ai,apiKey:undefined},session,lastSummary});
+    const pokerStats=normalizeStats(this.careerStats.player??this.session?.engine.players?.[0]?.stats);
+    return clone({app:'afterhours-poker',currency:'USD',profile:{...this.profile,pokerStats},styles:STYLES,rosterCounts:{club:CLUB_ROSTER.length},world:publicWorld(this.world),ai:{...this.ai,apiKey:undefined},session,lastSummary});
   }
   checkTurn(body){
     if(!this.session||body?.sessionId!==this.session.id)throw new Error('场次已变化，请以当前牌桌为准');
@@ -122,7 +129,7 @@ export class MobileGameStore {
   localBotTick(body){
     this.checkTurn(body);const e=this.session.engine,h=e.hand;
     if(!e.active)return this.state();
-    if(h.actor===null){e.advance();this.session.wallet=this.profile.wallet;this.save();return this.state();}
+    if(h.actor===null){if(h.allInShowdown&&Number(h.runoutNextAt)>Date.now())return this.state();e.advance();this.session.wallet=this.profile.wallet;this.save();return this.state();}
     if(h.actor===0)throw new Error('尚未轮到电脑行动');
     const acting=e.players[h.actor];
     if(acting?.status==='sittingOut')return this.applyBotDecision(body,{action:e.legal(h.actor)?.canCheck?'check':'fold'},{source:'local',thinkTimeMs:0,timingKind:'sitting-out'});
@@ -138,7 +145,7 @@ export class MobileGameStore {
     this.checkTurn(body);const e=this.session.engine;if(!e.active||e.hand.actor===null||e.hand.actor===0)return this.state();
     const observation=botObservation(e,e.hand.actor),started=Date.now(),controller=new AbortController();let decision,metadata,actionWindowExpired=false;const actionWindow=setTimeout(()=>{actionWindowExpired=true;controller.abort();},BOT_ACTION_WINDOW_MS);
     try{const result=await requestMobileAI(this.ai,observation,{signal:controller.signal});decision=result.decision;metadata={source:'external',model:this.ai.model,elapsedMs:result.elapsedMs,usage:result.usage};this.ai.lastSource='external';this.ai.lastError='';}
-    catch(error){decision=chooseBotAction(observation,this.random);metadata={source:'fallback',model:this.ai.model,elapsedMs:Date.now()-started,errorCode:actionWindowExpired?'action_window':error.code??'external_error',error:actionWindowExpired?'外部 AI 未在 20 秒内完成，本地策略已接管':error.message};this.ai.lastSource='fallback';this.ai.lastError=metadata.error;}
+    catch(error){decision=chooseBotAction(observation,this.random);metadata={source:'fallback',model:this.ai.model,elapsedMs:Date.now()-started,errorCode:actionWindowExpired?'action_window':error.code??'external_error',error:actionWindowExpired?'外部 AI 未在 20 秒内完成，本地策略已接管':error.message,...(error?.responseDiagnostic?{responseDiagnostic:error.responseDiagnostic}:{})};this.ai.lastSource='fallback';this.ai.lastError=metadata.error;}
     finally{clearTimeout(actionWindow);}
     try{const result=this.applyBotDecision(body,decision,metadata);this.save();return result;}catch{return this.state();}
   }
@@ -175,7 +182,7 @@ export class MobileGameStore {
     const url=new URL('/api/'+route,'https://afterhours.mobile'),name=url.pathname.slice(5);
     if(body===undefined){
       if(name==='music')return {tracks:MUSIC_FILES.map(file=>({id:file,name:file.replace(/\.mp3$/i,''),url:'/music/'+encodeURIComponent(file)}))};
-      if(name==='contacts')return {players:[...LOCAL_ROSTER,...AI_ROSTER].map(p=>this.publicOpponent(p,this.lastSummary?.id))};
+      if(name==='contacts')return {players:CLUB_ROSTER.map(p=>this.publicOpponent(p,this.lastSummary?.id))};
       if(name==='health')return {app:'afterhours-poker',platform:'android'};
       if(name==='state')return this.state();
       if(name==='ai-settings')return {...this.ai,apiKey:undefined};
@@ -204,7 +211,7 @@ export class MobileGameStore {
     if(name==='action')e.act(0,body.action,body.amount,{thinkTimeMs:body.thinkTimeMs});
     else if(name==='extend')e.extendActionTime(0);
     else if(name==='timeout')e.expireAction(0);
-    else if(name==='tick'){if(e.active){if(e.hand.actor===null)e.advance();else if(e.hand.actor!==0)return this.ai.mode==='external'?this.externalBotTick(body):this.localBotTick(body);}}
+    else if(name==='tick'){if(e.active){if(e.hand.actor===null){if(!(e.hand.allInShowdown&&Number(e.hand.runoutNextAt)>Date.now()))e.advance();}else if(e.hand.actor!==0)return this.ai.mode==='external'?this.externalBotTick(body):this.localBotTick(body);}}
     else if(name==='next')e.startHand();
     else if(name==='show')e.showCards();
     else if(name==='rebuy'){const target=Number(body.target),amount=target-e.players[0].stack;if(amount>this.profile.wallet)throw new Error('账户余额不足，请领取每日补助');e.topUp(0,target);this.profile.wallet-=amount;}

@@ -20,8 +20,11 @@ export function buildReport(session,{discovery}={}) {
   // to open v3 sessions; new fields are additive.
   report.schemaVersion='2.2';
   const decisions=[...e.hands,...(e.active?[e.hand]:[])].flatMap(h=>h.aiDecisions??[]);
-  report.aiSummary={local:decisions.filter(d=>d.source==='local').length,external:decisions.filter(d=>d.source==='external').length,fallback:decisions.filter(d=>d.source==='fallback').length};
-  report.notes.push('aiDecisions 记录各电脑行动由本地机器人、外部 AI 或异常接管产生，含模型、用时、用量和错误类型；不包含 API Key。外部 AI 只收到该座位可知的信息，返回动作经规则校验后执行。');
+  const importantHands=[...e.hands,...(e.active?[e.hand]:[])].filter(hand=>hand.importantHand?.potBB>=100).map(hand=>structuredClone(hand.importantHand));
+  report.importantHands=importantHands;
+  report.aiSummary={local:decisions.filter(d=>d.source==='local').length,localRule:decisions.filter(d=>d.source==='local-rule').length,external:decisions.filter(d=>d.source==='external').length,fallback:decisions.filter(d=>d.source==='fallback').length};
+  report.notes.push('aiDecisions 记录各电脑行动由本地机器人、本地规则直判、外部 AI 或异常接管产生，含模型、用时、用量和错误类型；不包含 API Key。若外部 AI 的 message.content 语法不可解析，会额外记录经脱敏、单条最多 12000 字符的 responseDiagnostic，便于排查兼容接口。外部 AI 只收到该座位可知的信息，返回动作经规则校验后执行。');
+  report.notes.push('底池达到 100BB 的已结算手牌标记为重要牌局。机器人只将其公开结果、公开进攻和主动亮牌当作短期、递减的桌面形象信号；不会从胜负推断未公开底牌。');
   report.notes.push('行动记录中的 thinkTimeMs 是玩家或机器人从轮到行动到提交动作的用时；机器人会把玩家用时当作有限、可误导的公开线索。玩家每回合基础限时 20 秒，延时按钮每次增加 20 秒。');
   const published=discovery?redactReport(report,discovery):report;
   for (const p of published.players) lines.push(`| ${p.name} | ${p.id===0?'真人':STYLES[p.style]?.name??'未解锁'} | ${p.buyIns} | ${p.endingStack} | ${signed(p.net)} | ${p.stats.hands?Math.round(100*p.stats.vpip/p.stats.hands):0}% | ${p.stats.hands?Math.round(100*p.stats.pfr/p.stats.hands):0}% |`);
@@ -30,8 +33,11 @@ export function buildReport(session,{discovery}={}) {
   lines.push('','## 补码流水','');
   if (!e.movements.length) lines.push('无补码。');
   for (const m of e.movements) lines.push(`- ${m.time} / 第 ${m.afterHand} 手后 / ${e.players[m.playerId].name} 补入 ${m.amount}，筹码至 ${m.target}`);
+  lines.push('','## 重要牌局（底池至少 100BB）','');
+  if(!importantHands.length)lines.push('本场尚无重要牌局。');
+  for(const important of importantHands){const players=important.players.map(entry=>`${e.players[entry.playerId]?.name??'未知玩家'}${entry.won?'赢池':''}${entry.aggressive?'，主动进攻':''}${entry.voluntaryShow?'，主动亮牌':''}`).join('；');lines.push(`- 第 ${important.handNumber} 手：${important.pot}（${important.potBB} BB）${important.showdown?'，摊牌':'，未摊牌'}。${players}`);}
   for (const h of [...e.hands,...(e.active?[e.hand]:[])]) {
-    lines.push('',`## 第 ${h.number} 手 · ${h.status==='complete'?'已结算':h.status==='aborted'?'中途作废':'进行中'}`,'',`按钮：${e.players[h.button].name}；小盲：${e.players[h.sb].name}；大盲：${e.players[h.bb].name}`,`公共牌：${cards(h.board)}`,'','| 玩家 | 起始筹码 | 底牌 | 结果 |','|---|---:|---|---|');
+    lines.push('',`## 第 ${h.number} 手 · ${h.status==='complete'?'已结算':h.status==='aborted'?'中途作废':'进行中'}${h.importantHand?.potBB>=100?` · 重要牌局 ${h.importantHand.potBB}BB`:''}`,'',`按钮：${e.players[h.button].name}；小盲：${e.players[h.sb].name}；大盲：${e.players[h.bb].name}`,`公共牌：${cards(h.board)}`,'','| 玩家 | 起始筹码 | 底牌 | 结果 |','|---|---:|---|---|');
     const holes=h.events.find(ev=>ev.type==='deal')?.holes??[];
     for (const p of e.players) {const r=h.results.find(r=>r.playerId===p.id);lines.push(`| ${p.name} | ${h.initialStacks[p.id]} | ${cards(holes.find(x=>x.playerId===p.id)?.cards)} | ${r?`${r.folded?'弃牌；':''}${r.rank?.name??''} 净 ${signed(r.net)}`:'未结算'} |`);}
     let street='';
@@ -42,7 +48,12 @@ export function buildReport(session,{discovery}={}) {
     if(h.aiDecisions?.length){
       lines.push('','### 电脑决策来源','','| 步骤 | 玩家 | 来源 | 模型 | 用时 | 动作 | 接管原因 |','|---:|---|---|---|---:|---|---|');
       const cell=v=>String(v??'—').replace(/\|/g,'\\|').replace(/[\r\n]/g,' ').replace(/</g,'&lt;');
-      for(const d of h.aiDecisions)lines.push(`| ${d.seq} | ${e.players[d.playerId].name} | ${{local:'本地机器人',external:'外部 AI',fallback:'本地接管'}[d.source]} | ${cell(d.model)} | ${d.elapsedMs??0} ms | ${d.action}${d.raiseTo!==undefined?' '+d.raiseTo:''} | ${cell(d.error)} |`);
+      for(const d of h.aiDecisions)lines.push(`| ${d.seq} | ${e.players[d.playerId].name} | ${{local:'本地机器人','local-rule':'本地规则直判',external:'外部 AI',fallback:'本地接管'}[d.source]??'未知来源'} | ${cell(d.model)} | ${d.elapsedMs??0} ms | ${d.action}${d.raiseTo!==undefined?' '+d.raiseTo:''} | ${cell(d.error)} |`);
+      const diagnostics=h.aiDecisions.filter(d=>typeof d.responseDiagnostic?.content==='string');
+      if(diagnostics.length){
+        lines.push('','#### 无法解析的 AI 原始响应（诊断）','');
+        for(const d of diagnostics){const diagnostic=d.responseDiagnostic,text=diagnostic.content.replace(/\r\n/g,'\n').replace(/\r/g,'\n');lines.push(`- 步骤 ${d.seq} / ${e.players[d.playerId].name}：原始长度 ${diagnostic.originalLength??text.length} 字符${diagnostic.truncated?'；日志已截断':''}${diagnostic.redacted?'；已脱敏':''}。`,'    '+(text||'（空字符串）').replace(/\n/g,'\n    '));}
+      }
     }
     if(h.pots.length) {lines.push('','### 底池分配','');for(const pot of h.pots)lines.push(`- ${pot.name} ${pot.amount}；有资格：${pot.eligible.map(id=>e.players[id].name).join('、')}；分配：${pot.awards.map(a=>e.players[a.playerId].name+' '+a.amount).join('、')}`);}
     if(h.memoryUpdates?.length){lines.push('','### 本手公开信息与对手记忆','');for(const m of h.memoryUpdates)lines.push(`- ${e.players[m.observerId].name} 观察 ${e.players[m.opponentId].name} 的${m.source==='voluntary'?'主动秀牌':'摊牌'} ${cards(m.cards)}：${m.evidence.label}${m.evidence.seq!==undefined?'，对应下注步骤 '+m.evidence.seq:''}；更新后诈唬证据 ${m.weightsAfter.bluff.toFixed(3)} / 价值证据 ${m.weightsAfter.value.toFixed(3)}；跟注评分修正 ${m.response.callAdjustment.toFixed(4)}（不是直接概率）。`);}

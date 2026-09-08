@@ -44,11 +44,16 @@ test('external observation isolates the acting seat and does not expose hidden c
   assert.ok(obs.legal);assert.ok(obs.requestId.endsWith(':1'));
 });
 
-test('external prompt is compact and routes none, low and medium reasoning by decision risk',()=>{
-  const low=testObservation(),compact=compactExternalObservation(low);
+test('external prompt is compact and reserves thinking effort for stack-committing decisions',()=>{
+  const low={...testObservation(),importantHands:[{handNumber:4,potBB:126,showdown:false,players:[{playerId:0,won:true,aggressive:true,allIn:false,voluntaryShow:true,showTag:'air_bluff'}]}]},compact=compactExternalObservation(low);
   assert.equal(decisionEffort(low),'none');assert.equal(compact.reasoningEffort,'none');assert.equal(compact.character,undefined);assert.equal(compact.playerCard,undefined);assert.equal(compact.players[0].hole,undefined);
-  assert.equal(decisionEffort({...low,street:'river'}),'low');assert.equal(decisionEffort({...low,legal:{...low.legal,toCall:20},pot:20}),'low');assert.equal(decisionEffort({...low,legal:{...low.legal,toCall:500},stack:900}),'medium');
-  assert.equal(localRuleDecision(low,()=>.5).reason,'free-check');
+  assert.ok(compact.actor.postflopInitiative>=.32&&compact.actor.postflopInitiative<=.76);assert.ok(compact.actor.bluffFrequency>=.018&&compact.actor.bluffFrequency<=.19);
+  assert.equal(compact.strategy.position,'heads_up');assert.equal(compact.strategy.boardTexture,'dry');assert.equal(compact.strategy.preflopInitiative,false);
+  assert.deepEqual(compact.draw,{active:false,kinds:[],outs:0,flushOuts:0,straightOuts:0,nextCardChance:0});
+  assert.deepEqual(compact.tableImage,[{handNumber:4,potBB:126,showdown:false,players:[{id:0,won:true,aggressive:true,allIn:false,voluntaryShow:true,showTag:'air_bluff'}]}]);
+  assert.equal(decisionEffort({...low,street:'river'}),'none');assert.equal(decisionEffort({...low,legal:{...low.legal,toCall:20},pot:20}),'none');assert.equal(decisionEffort({...low,legal:{...low.legal,toCall:500},stack:900}),'high');
+  assert.equal(localRuleDecision(low,()=>.5),null,'postflop free actions must reach the AI instead of being forced checks');
+  assert.equal(localRuleDecision({...low,street:'preflop'},()=>.5).reason,'free-preflop-check');
 });
 
 test('decision validation preserves betting rules including short all-ins and unopened raise rights',()=>{
@@ -61,13 +66,38 @@ test('decision validation preserves betting rules including short all-ins and un
 test('compatible API sends only two stateless messages and validates the model response over HTTP',async t=>{
   let seen;const baseUrl=await endpoint(t,async(req,res)=>{seen={url:req.url,auth:req.headers.authorization,body:await read(req)};respond(res,{action:'raise',raiseTo:25},{usage:{prompt_tokens:120,completion_tokens:16,total_tokens:136}});});
   const result=await requestDecision({baseUrl,model:'chosen-model',apiKey:'fake-test-key',timeoutSeconds:5},testObservation());
-  assert.equal(seen.url,'/v1/chat/completions');assert.equal(seen.auth,'Bearer fake-test-key');assert.equal(seen.body.model,'chosen-model');assert.equal(seen.body.stream,false);assert.equal(seen.body.temperature,.15);assert.equal(seen.body.max_tokens,32);assert.deepEqual(seen.body.response_format,{type:'json_object'});assert.equal(seen.body.reasoning_effort,'none');assert.equal(seen.body.messages.length,2);const prompt=JSON.parse(seen.body.messages[1].content);assert.equal(prompt.requestId,'connection-test');assert.equal(prompt.character,undefined);assert.equal(result.decision.amount,25);assert.equal(result.usage.total_tokens,136);
+  assert.equal(seen.url,'/v1/chat/completions');assert.equal(seen.auth,'Bearer fake-test-key');assert.equal(seen.body.model,'chosen-model');assert.equal(seen.body.stream,false);assert.equal(seen.body.temperature,.15);assert.equal(seen.body.max_tokens,48);assert.deepEqual(seen.body.response_format,{type:'json_object'});assert.deepEqual(seen.body.thinking,{type:'disabled'});assert.equal(seen.body.reasoning_effort,undefined);assert.equal(seen.body.messages.length,2);const prompt=JSON.parse(seen.body.messages[1].content);assert.equal(prompt.requestId,'connection-test');assert.equal(prompt.character,undefined);assert.equal(result.decision.amount,25);assert.equal(result.usage.total_tokens,136);
+});
+
+test('ordinary external decisions disable provider thinking and reserve a short JSON budget',async t=>{
+  let seen;const baseUrl=await endpoint(t,async(req,res)=>{seen={body:await read(req)};respond(res,{action:'call'});});
+  const observation={...testObservation(),street:'turn',board:['2h','7c','Ts','Jd'],legal:{...testObservation().legal,canCheck:false,toCall:20,fullToCall:20,minRaiseTo:40,maxRaiseTo:990}};
+  await requestDecision({baseUrl,model:'chosen-model',apiKey:'fake-test-key',timeoutSeconds:5},observation);
+  assert.deepEqual(seen.body.thinking,{type:'disabled'});assert.equal(seen.body.reasoning_effort,undefined);assert.equal(seen.body.max_tokens,48);assert.deepEqual(seen.body.response_format,{type:'json_object'});
+});
+
+test('all-in and stack-commitment decisions enable high-effort reasoning with a JSON final answer',async t=>{
+  let seen;const baseUrl=await endpoint(t,async(req,res)=>{seen={body:await read(req)};respond(res,{action:'call'});});
+  const observation={...testObservation(),street:'river',board:['2h','7c','Ts','Jd','Qh'],stack:900,legal:{...testObservation().legal,canCheck:false,toCall:500,fullToCall:500,minRaiseTo:1000,maxRaiseTo:900}};
+  await requestDecision({baseUrl,model:'chosen-model',apiKey:'fake-test-key',timeoutSeconds:5},observation);
+  assert.deepEqual(seen.body.thinking,{type:'enabled'});assert.equal(seen.body.reasoning_effort,'high');assert.equal(seen.body.max_tokens,512);assert.equal(seen.body.temperature,undefined);assert.deepEqual(seen.body.response_format,{type:'json_object'});
+  assert.equal(JSON.parse(seen.body.messages[1].content).reasoningEffort,'high');
 });
 
 test('HTTP errors, invalid JSON, illegal actions and oversize bodies cannot be executed or leak provider text',async t=>{
   let kind='auth';const baseUrl=await endpoint(t,async(req,res)=>{await read(req);if(kind==='auth'){res.statusCode=401;res.end('secret echo fake-test-key');}else if(kind==='json'){res.end('not json');}else if(kind==='action'){respond(res,{action:'raise',raiseTo:999999});}else{res.end('x'.repeat(270000));}});
   const config={baseUrl,model:'m',apiKey:'fake-test-key',timeoutSeconds:5};
   for(const variant of ['auth','json','action','size']){kind=variant;await assert.rejects(requestDecision(config,testObservation()),error=>error instanceof AIError&&!error.message.includes('fake-test-key'));}
+});
+
+test('syntax-invalid model content is redacted and retained in JSON and Markdown diagnostics',async t=>{
+  const raw='I will fold now.\n{"action":"fold"}\napiKey=fake-test-key';
+  const baseUrl=await endpoint(t,async(req,res)=>{await read(req);res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{message:{content:raw}}]}));});
+  const {root,store,service}=game(t,baseUrl),e=store.session.engine;
+  await service.dispatch('tick',payload(store));const decision=e.hand.aiDecisions.at(-1);
+  assert.equal(decision.source,'fallback');assert.equal(decision.errorCode,'invalid_response');assert.equal(decision.responseDiagnostic.originalLength,raw.length);assert.equal(decision.responseDiagnostic.truncated,false);assert.equal(decision.responseDiagnostic.redacted,true);assert.ok(decision.responseDiagnostic.content.includes('apiKey=[REDACTED]'));assert.ok(!decision.responseDiagnostic.content.includes('fake-test-key'));
+  await service.dispatch('end',{sessionId:store.session.id});const json=JSON.parse(fs.readFileSync(path.join(root,'日志',store.lastSummary.reports.json),'utf8')),markdown=fs.readFileSync(path.join(root,'日志',store.lastSummary.reports.markdown),'utf8');
+  const reported=json.hands.flatMap(hand=>hand.aiDecisions??[]).find(entry=>entry.errorCode==='invalid_response');assert.equal(reported.responseDiagnostic.content,decision.responseDiagnostic.content);assert.ok(markdown.includes('无法解析的 AI 原始响应（诊断）'));assert.ok(markdown.includes('apiKey=[REDACTED]'));assert.ok(!JSON.stringify(json).includes('fake-test-key'));assert.ok(!markdown.includes('fake-test-key'));
 });
 
 test('timeout, explicit cancellation and redirect handling bound network work without forwarding keys',async t=>{
@@ -99,6 +129,15 @@ test('a slow external turn is locally managed at the twenty-second action window
 test('check and ordinary preflop entries bypass the provider through local rules',async t=>{
   let calls=0;const {store,service}=game(t,undefined,{useLocalRules:true,request:()=>{calls++;throw new Error('provider should not be called');}}),e=store.session.engine;
   await service.dispatch('tick',payload(store));assert.equal(calls,0);assert.equal(e.hand.aiDecisions.at(-1).source,'local-rule');assert.equal(service.state().ai.lastSource,'local-rule');
+});
+
+test('a postflop free action reaches the provider and can make a continuation bet',async t=>{
+  let seen;const {store,service}=game(t,undefined,{useLocalRules:true,request:(_config,observation)=>{seen=observation;return {decision:{action:'raise',amount:observation.legal.minRaiseTo},elapsedMs:1,usage:{}};}}),e=store.session.engine;
+  await service.dispatch('tick',payload(store)); // preflop big-blind check stays local
+  await service.dispatch('tick',payload(store)); // advance to flop
+  assert.equal(e.hand.street,'flop');assert.equal(e.hand.actor,1);
+  await service.dispatch('tick',payload(store));
+  assert.equal(seen.street,'flop');assert.equal(e.hand.aiDecisions.at(-1).source,'external');assert.equal(e.hand.events.at(-1).action,'raise');
 });
 
 test('duplicate ticks coalesce; changing credentials cancels pending decisions; mode changes wait until leaving',async t=>{
