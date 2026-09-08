@@ -13,8 +13,11 @@ export function normalizeStats(stats={}){
 }
 
 export function mergeCareerStats(player,careerStats={}){
-  const saved=careerStats[playerKey(player)];
-  player.stats=normalizeStats(saved?{...saved,...player.stats}:player.stats);
+  const saved=normalizeStats(careerStats[playerKey(player)]),current=normalizeStats(player.stats);
+  // A fresh seat starts at zero. Keep its returning character's accumulated
+  // public tendencies instead of allowing those placeholder zeros to erase
+  // the range evidence gathered in earlier sessions.
+  player.stats=Object.fromEntries(STAT_KEYS.map(name=>[name,Math.max(saved[name],current[name])]));
   return player;
 }
 

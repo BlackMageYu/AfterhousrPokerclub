@@ -16,13 +16,21 @@ export function preflopStrength(hole) {
   return Math.min(0.96,0.10+a/24+b/48+(hole[0][1]===hole[1][1]?0.065:0)+(a-b===1?0.045:a-b===2?0.02:0)-(a-b>4?0.05:0));
 }
 export function estimateEquity(obs, random=Math.random, samples=90) {
-  const opponents=obs.players.filter(p=>p.id!==obs.id&&!p.folded).length;
-  if (!opponents) return 1;
+  const opponents=obs.players.filter(p=>p.id!==obs.id&&!p.folded);
+  if (!opponents.length) return 1;
   const known=new Set([...obs.hole,...obs.board]),unknown=newDeck().filter(c=>!known.has(c));let wins=0;
   for (let i=0;i<samples;i++) {
-    const deck=shuffle(unknown,random),board=[...obs.board];while(board.length<5)board.push(deck.pop());
+    // Opponent cards are sampled from a range reconstructed only from public
+    // actions, position and observed tendencies.  They are dealt before the
+    // unseen board, so this cannot learn the real hidden cards or future runout.
+    let deck=[...unknown],opponentHoles=[];
+    for(const opponent of opponents){
+      const hole=sampleOpponentRange(obs,opponent.id,deck,random);opponentHoles.push(hole);
+      const removed=new Set(hole);deck=deck.filter(card=>!removed.has(card));
+    }
+    const board=[...obs.board],runout=shuffle(deck,random);while(board.length<5)board.push(runout.pop());
     const score=evaluate([...obs.hole,...board]).score;let tied=1,lost=false;
-    for (let j=0;j<opponents;j++) {const other=evaluate([deck.pop(),deck.pop(),...board]).score;if(other>score){lost=true;break;}if(other===score)tied++;}
+    for(const hole of opponentHoles){const other=evaluate([...hole,...board]).score;if(other>score){lost=true;break;}if(other===score)tied++;}
     if (!lost) wins+=1/tied;
   }
   return wins/samples;
@@ -138,6 +146,66 @@ export function decisionContext(obs){
   const spr=Math.max(0,(Number.isFinite(effectiveStack)?effectiveStack:numeric(obs.stack))/pot),showdownValue=texture.madeCategory!==null&&(texture.madeCategory>=2||texture.topPair||texture.overpair);
   return {position,initiative:preflopAggressor===obs.id,effectiveStack:Number.isFinite(effectiveStack)?effectiveStack:numeric(obs.stack),spr,lowSpr:spr<=3,deepSpr:spr>=7,texture,draw,opponents:opponentContext(obs),important:importantHandContext(obs),showdownValue,potControl:!draw.active&&texture.madeCategory!==null&&texture.madeCategory<=1&&!texture.topPair&&!texture.overpair&&spr>=5};
 }
+
+// Reconstruct a deliberately coarse opponent range using only public actions,
+// position and observed VPIP/PFR. It is not a solver range: the purpose is to
+// stop local equity from treating a 3-bettor exactly like a limper.
+export function opponentRangeProfile(obs,playerId){
+  const player=(obs.players??[]).find(entry=>entry.id===playerId)??{},position=positionContext({...obs,id:playerId}),preflopActions=(obs.actions??[]).filter(action=>action.street==='preflop'),preflop=preflopActions.filter(action=>action.playerId===playerId),allActions=(obs.actions??[]).filter(action=>action.playerId===playerId),vpip=statRate(player,'vpip'),pfr=statRate(player,'pfr');
+  let floor=.18,raises=0,calls=0;
+  for(const action of preflop){
+    const earlierRaises=preflopActions.slice(0,preflopActions.indexOf(action)).filter(entry=>entry.action==='raise'||entry.action==='allin').length;
+    if(action.action==='raise'||action.action==='allin'){
+      raises++;floor=Math.max(floor,earlierRaises===0?.53-position.openingAdjustment*.65:.64+Math.min(.18,earlierRaises*.08));
+    }else if(action.action==='call'){
+      calls++;floor=Math.max(floor,earlierRaises===0?.25:.42+Math.min(.16,earlierRaises*.07));
+    }
+  }
+  // A low-PFR player who raises is usually stronger; a high-VPIP/PFR player
+  // is allowed a somewhat wider public range, but never a random-card range.
+  if(pfr!==null)floor+=clamp((.18-pfr)*.14,-.04,.045);
+  if(vpip!==null)floor-=clamp((vpip-.28)*.09,-.04,.045);
+  const postflop=allActions.filter(action=>action.street!=='preflop'),postflopAggression=postflop.filter(action=>action.action==='raise'||action.action==='allin').length,postflopCalls=postflop.filter(action=>action.action==='call').length;
+  return {preflopFloor:Math.round(clamp(floor,.16,.90)*1000)/1000,raises,calls,postflopAggression,postflopCalls,position:position.label,sampled:vpip!==null||pfr!==null};
+}
+
+// Weight a hypothetical two-card holding against the public range above. The
+// caller supplies only candidate cards from the unseen deck; no actual hidden
+// opponent card is ever read here.
+export function opponentRangeWeight(obs,playerId,hole){
+  const profile=opponentRangeProfile(obs,playerId),ranks=hole.map(rankOf).sort((a,b)=>b-a),pair=ranks[0]===ranks[1],suited=hole[0]?.[1]===hole[1]?.[1],connected=Math.abs(ranks[0]-ranks[1])<=1;
+  let weight=Math.pow(sigmoid((preflopStrength(hole)-profile.preflopFloor)/.055),1.3);
+  if(pair)weight*=1.14;
+  if(suited)weight*=profile.calls>0?1.12:1.05;
+  if(connected&&profile.calls>0)weight*=1.08;
+  if((obs.board??[]).length>=3){
+    const texture=boardTexture(hole,obs.board),draw=drawProfile(hole,obs.board),strong=texture.madeCategory>=2||texture.topPair||texture.overpair,memory=obs.memory?.[playerId]??{},bluffTail=clamp(numeric(memory.bluffWeight)*.14+numeric(memory.wideWeight)*.06,0,.22);
+    // A seen bluff does not make a bet weak by default, but it restores a
+    // bounded bluff tail to the opponent range for later bluff-catch spots.
+    if(profile.postflopAggression>0)weight*=strong?1:draw.active?.66+bluffTail*.35:.20+bluffTail;
+    else if(profile.postflopCalls>0)weight*=strong?1:draw.active?.78:.38;
+  }
+  return clamp(weight,.004,.995);
+}
+
+function sampleOpponentRange(obs,playerId,deck,random){
+  if(deck.length<2)throw new Error('范围模拟没有足够的未知牌');
+  let best=[deck[0],deck[1]],bestWeight=0;
+  // Rejection sampling keeps a range draw inexpensive even in multiway pots.
+  for(let attempt=0;attempt<24;attempt++){
+    const first=Math.floor(random()*deck.length),second=(first+1+Math.floor(random()*(deck.length-1)))%deck.length,hole=[deck[first],deck[second]],weight=opponentRangeWeight(obs,playerId,hole);
+    if(weight>bestWeight){best=hole;bestWeight=weight;}
+    if(random()<weight)return hole;
+  }
+  return best;
+}
+
+export function equitySampleCount(obs){
+  const opponents=(obs.players??[]).filter(player=>player.id!==obs.id&&!player.folded).length,potBB=numeric(obs.pot)/Math.max(1,numeric(obs.bb)),pressure=numeric(obs.legal?.toCall)/Math.max(1,numeric(obs.pot)),lateStreet=(obs.board??[]).length>=4;
+  if(lateStreet&&(potBB>=25||opponents>=2||pressure>=.50))return 700;
+  if(lateStreet)return 300;
+  return 160;
+}
 export function decisionProfile(obs){
   const base=STYLES[obs.style];if(!base)throw new Error('未知电脑风格');
   const t=obs.traits??{},p=obs.plan??{};
@@ -209,7 +277,7 @@ export function chooseBotAction(obs,random=Math.random){
     if(l.canRaise&&random()<raiseChance)return raise();
     return {action:l.canCheck?'check':'call'};
   }
-  const equity=estimateEquity(obs,random,obs.style==='GRINDER'?140:100);
+  const equity=estimateEquity(obs,random,equitySampleCount(obs));
   const perceived=clamp(equity+(random()-.5)*(.025+(1-s.discipline)*.05+(1-s.level)*.045)),multiway=live.length>1;
   const draw=context.draw,hasDraw=draw.active,callMargin=(.5-s.looseness)*.16+raises*.018*s.discipline+(obs.traits?.callCaution??0)+(context.texture.wet&&multiway?.018:0);
   const opponent=obs.players.find(p=>p.id===aggressor),loose=opponent?.stats.hands>=10&&opponent.stats.vpip/opponent.stats.hands>.50;
@@ -231,7 +299,11 @@ export function chooseBotAction(obs,random=Math.random){
   // governs all-in calls, made hands, and situations with more cards to come.
   if(!l.canCheck){
     const minimumEquity=potOdds+priceMargin;
-    if(!hasDraw&&perceived<minimumEquity)return {action:'fold'};
+    // A modest river bluff-catch is allowed only after public bluff evidence,
+    // at a favourable price and with some showdown value. This keeps one seen
+    // bluff from making the bot spew, while letting table image matter.
+    const informedRiverBluffCatch=obs.street==='river'&&!hasDraw&&response.callAdjustment>=.018&&potOdds<=.38&&perceived>=.16;
+    if(!hasDraw&&perceived<minimumEquity&&!informedRiverBluffCatch)return {action:'fold'};
     if(priceToPot>=1&&perceived<.60+(multiway?.04:0))return {action:'fold'};
     if(stackRisk>=.50&&perceived<.68)return {action:'fold'};
     if(hasDraw&&drawPriceSupported){

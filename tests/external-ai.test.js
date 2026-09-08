@@ -6,7 +6,7 @@ import path from 'node:path';
 import http from 'node:http';
 import {once} from 'node:events';
 import {AISettings,completionEndpoint} from '../src/ai-settings.js';
-import {AIGameService,requestDecision,externalObservation,compactExternalObservation,decisionEffort,localRuleDecision,validateDecision,testObservation,aiActionWindowMs,BOT_ACTION_WINDOW_MS,ALL_IN_CALL_WINDOW_MS,AIError} from '../src/external-ai.js';
+import {AIGameService,requestDecision,externalObservation,compactExternalObservation,decisionEffort,localRuleDecision,reviewExternalDecision,validateDecision,testObservation,aiActionWindowMs,BOT_ACTION_WINDOW_MS,ALL_IN_CALL_WINDOW_MS,AIError} from '../src/external-ai.js';
 import {GameStore} from '../src/store.js';
 
 function temporary(t){const root=fs.mkdtempSync(path.join(os.tmpdir(),'poker-api-'));t.after(()=>{const absolute=path.resolve(root);assert.ok(absolute.startsWith(path.resolve(os.tmpdir())+path.sep)&&path.basename(root).startsWith('poker-api-'));fs.rmSync(absolute,{recursive:true,force:true});});return root;}
@@ -56,6 +56,14 @@ test('external prompt is compact and reserves thinking effort for stack-committi
   assert.equal(localRuleDecision({...low,street:'preflop'},()=>.5).reason,'free-preflop-check');
 });
 
+test('a decisive river value hand receives deliberate reasoning and cannot silently check away value',()=>{
+  const base=testObservation(),observation={...base,street:'river',bb:200,pot:7700,stack:19808,hole:['Ah','Th'],board:['4c','As','7h','Ac','5d'],actions:[{playerId:0,street:'preflop',action:'raise',amount:800,raiseTo:800},{playerId:1,street:'preflop',action:'call',amount:800},{playerId:1,street:'turn',action:'raise',amount:1400,raiseTo:1400},{playerId:0,street:'turn',action:'call',amount:1400}],legal:{...base.legal,canCheck:true,canRaise:true,canAllIn:true,toCall:0,fullToCall:0,minRaiseTo:800,maxRaiseTo:19808}};
+  const compact=compactExternalObservation(observation),review=reviewExternalDecision(observation,{action:'check'});
+  assert.equal(decisionEffort(observation),'high');assert.equal(compact.reasoningEffort,'high');
+  assert.deepEqual(review.decision,{action:'raise',amount:3619});assert.equal(review.guard.kind,'river-strong-value-check-override');assert.equal(review.guard.madeHand,'trips');
+  const unsafe={...observation,board:['4s','As','7s','Ac','5s']};assert.deepEqual(reviewExternalDecision(unsafe,{action:'check'}),{decision:{action:'check'},guard:null},'four-flush boards retain the model-selected check');
+});
+
 test('decision validation preserves betting rules including short all-ins and unopened raise rights',()=>{
   const obs=testObservation();assert.deepEqual(validateDecision({action:'raise',raiseTo:25},obs),{action:'raise',amount:25});assert.throws(()=>validateDecision({action:'call'},obs));
   for(const raiseTo of [0,5,991,1.5,'20',null])assert.throws(()=>validateDecision({action:'raise',raiseTo},obs));
@@ -66,22 +74,30 @@ test('decision validation preserves betting rules including short all-ins and un
 test('compatible API sends only two stateless messages and validates the model response over HTTP',async t=>{
   let seen;const baseUrl=await endpoint(t,async(req,res)=>{seen={url:req.url,auth:req.headers.authorization,body:await read(req)};respond(res,{action:'raise',raiseTo:25},{usage:{prompt_tokens:120,completion_tokens:16,total_tokens:136}});});
   const result=await requestDecision({baseUrl,model:'chosen-model',apiKey:'fake-test-key',timeoutSeconds:5},testObservation());
-  assert.equal(seen.url,'/v1/chat/completions');assert.equal(seen.auth,'Bearer fake-test-key');assert.equal(seen.body.model,'chosen-model');assert.equal(seen.body.stream,false);assert.equal(seen.body.temperature,.15);assert.equal(seen.body.max_tokens,48);assert.deepEqual(seen.body.response_format,{type:'json_object'});assert.deepEqual(seen.body.thinking,{type:'disabled'});assert.equal(seen.body.reasoning_effort,undefined);assert.equal(seen.body.messages.length,2);const prompt=JSON.parse(seen.body.messages[1].content);assert.equal(prompt.requestId,'connection-test');assert.equal(prompt.character,undefined);assert.equal(result.decision.amount,25);assert.equal(result.usage.total_tokens,136);
+  assert.equal(seen.url,'/v1/chat/completions');assert.equal(seen.auth,'Bearer fake-test-key');assert.equal(seen.body.model,'chosen-model');assert.equal(seen.body.stream,false);assert.equal(seen.body.temperature,.15);assert.equal(seen.body.max_tokens,48);assert.deepEqual(seen.body.response_format,{type:'json_object'});assert.deepEqual(seen.body.thinking,{type:'disabled'});assert.equal(seen.body.reasoning_effort,undefined);assert.equal(seen.body.messages.length,2);const prompt=JSON.parse(seen.body.messages[1].content);assert.equal(prompt.requestId,'connection-test');assert.equal(prompt.character,undefined);assert.equal(prompt.opponentRanges[0].position,'heads_up');assert.equal(result.decision.amount,25);assert.equal(result.usage.total_tokens,136);
 });
 
-test('ordinary external decisions disable provider thinking and reserve a short JSON budget',async t=>{
+test('turn decisions facing pot-sized pressure use deliberate reasoning',async t=>{
   let seen;const baseUrl=await endpoint(t,async(req,res)=>{seen={body:await read(req)};respond(res,{action:'call'});});
   const observation={...testObservation(),street:'turn',board:['2h','7c','Ts','Jd'],legal:{...testObservation().legal,canCheck:false,toCall:20,fullToCall:20,minRaiseTo:40,maxRaiseTo:990}};
   await requestDecision({baseUrl,model:'chosen-model',apiKey:'fake-test-key',timeoutSeconds:5},observation);
-  assert.deepEqual(seen.body.thinking,{type:'disabled'});assert.equal(seen.body.reasoning_effort,undefined);assert.equal(seen.body.max_tokens,48);assert.deepEqual(seen.body.response_format,{type:'json_object'});
+  assert.deepEqual(seen.body.thinking,{type:'enabled'});assert.equal(seen.body.reasoning_effort,'high');assert.equal(seen.body.max_tokens,1024);assert.deepEqual(seen.body.response_format,{type:'json_object'});
 });
 
 test('all-in and stack-commitment decisions enable high-effort reasoning with a JSON final answer',async t=>{
   let seen;const baseUrl=await endpoint(t,async(req,res)=>{seen={body:await read(req)};respond(res,{action:'call'});});
   const observation={...testObservation(),street:'river',board:['2h','7c','Ts','Jd','Qh'],stack:900,legal:{...testObservation().legal,canCheck:false,toCall:500,fullToCall:500,minRaiseTo:1000,maxRaiseTo:900}};
   await requestDecision({baseUrl,model:'chosen-model',apiKey:'fake-test-key',timeoutSeconds:5},observation);
-  assert.deepEqual(seen.body.thinking,{type:'enabled'});assert.equal(seen.body.reasoning_effort,'high');assert.equal(seen.body.max_tokens,512);assert.equal(seen.body.temperature,undefined);assert.deepEqual(seen.body.response_format,{type:'json_object'});
+  assert.deepEqual(seen.body.thinking,{type:'enabled'});assert.equal(seen.body.reasoning_effort,'high');assert.equal(seen.body.max_tokens,1024);assert.equal(seen.body.temperature,undefined);assert.deepEqual(seen.body.response_format,{type:'json_object'});
   assert.equal(JSON.parse(seen.body.messages[1].content).reasoningEffort,'high');
+});
+
+test('an empty high-reasoning final retries once in JSON-only mode without recording private reasoning',async t=>{
+  const seen=[];const baseUrl=await endpoint(t,async(req,res)=>{const body=await read(req);seen.push(body);res.setHeader('Content-Type','application/json');if(seen.length===1){res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'',reasoning_content:'private chain fake-test-key'}}],usage:{prompt_tokens:100,completion_tokens:1024,total_tokens:1124}}));return;}respond(res,{action:'fold'},{usage:{prompt_tokens:90,completion_tokens:5,total_tokens:95}});});
+  const observation={...testObservation(),street:'river',board:['2h','7c','Ts','Jd','Qh'],stack:900,legal:{...testObservation().legal,canCheck:false,toCall:500,fullToCall:500,minRaiseTo:1000,maxRaiseTo:900}};
+  const result=await requestDecision({baseUrl,model:'chosen-model',apiKey:'fake-test-key',timeoutSeconds:5},observation);
+  assert.equal(seen.length,2);assert.deepEqual(seen[0].thinking,{type:'enabled'});assert.equal(seen[0].max_tokens,1024);assert.deepEqual(seen[1].thinking,{type:'disabled'});assert.equal(seen[1].reasoning_effort,undefined);assert.equal(seen[1].max_tokens,48);
+  assert.equal(result.decision.action,'fold');assert.equal(result.recovery.kind,'empty-final-retry');assert.equal(result.recovery.initialResponse.finishReason,'length');assert.equal(result.recovery.initialResponse.hasReasoningContent,true);assert.equal(result.recovery.initialResponse.reasoningLength,27);assert.equal(result.usage.total_tokens,1219);assert.ok(!JSON.stringify(result).includes('private chain'));assert.ok(!JSON.stringify(result).includes('fake-test-key'));
 });
 
 test('HTTP errors, invalid JSON, illegal actions and oversize bodies cannot be executed or leak provider text',async t=>{

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {HoldemEngine,PLAYER_ACTION_TIME_MS,ACTION_EXTENSION_MS} from '../src/engine.js';
 import {newDeck,evaluate} from '../src/cards.js';
-import {botObservation,chooseBotAction,chooseBotTiming,decisionContext,drawProfile,importantHandContext} from '../src/bot.js';
+import {botObservation,chooseBotAction,chooseBotTiming,decisionContext,drawProfile,equitySampleCount,estimateEquity,importantHandContext,opponentRangeProfile,opponentRangeWeight} from '../src/bot.js';
 import {GameStore} from '../src/store.js';
 import {STYLES} from '../src/styles.js';
 import {buildReport} from '../src/report.js';
@@ -180,6 +180,13 @@ test('bots use public stack depth, position, board texture and opponent rates fo
   const context=decisionContext(setMine);assert.equal(context.position.label,'cutoff');assert.equal(context.opponents.tight,true);assert.ok(context.spr>10);assert.equal(chooseBotAction(setMine,()=>.99).action,'call','deep stacks permit a priced small-pair set mine');
   assert.equal(chooseBotAction({...setMine,stack:200,players:setMine.players.map(player=>({...player,stack:200}))},()=>.99).action,'fold','the same pair is not mined at shallow effective depth');
   const post=decisionContext({...setMine,street:'flop',hole:['Ah','Qs'],board:['Kh','Jh','3c'],pot:80,actions:[]});assert.equal(post.texture.nutFlushBlocker,true);assert.equal(post.texture.broadwayBlockers,2);assert.equal(post.initiative,false);
+});
+test('range-aware equity narrows a raiser from public actions and reserves deep sampling for complex pots',()=>{
+  const base={id:1,style:'TAG',level:.8,hole:['Qh','Jd'],stack:1800,streetBet:0,board:['9c','6h','2d','Ks'],street:'turn',button:1,bb:10,pot:300,memory:{},legal:{toCall:150,fullToCall:150,eligiblePotAfterCall:600,canCheck:false,canRaise:true,canAllIn:true,minRaiseTo:450,maxRaiseTo:1800},actions:[{playerId:0,action:'raise',street:'preflop',raiseTo:30},{playerId:1,action:'call',street:'preflop',amount:30},{playerId:0,action:'raise',street:'turn',raiseTo:150}],players:[{id:0,stack:1800,folded:false,allIn:false,status:'active',stats:{hands:100,vpip:12,pfr:8}},{id:1,stack:1800,folded:false,allIn:false,status:'active',stats:{hands:100,vpip:25,pfr:18}}]};
+  const tight=opponentRangeProfile(base,0),looseObservation={...base,players:base.players.map(player=>player.id===0?{...player,stats:{hands:100,vpip:52,pfr:32}}:player)},loose=opponentRangeProfile(looseObservation,0);
+  assert.ok(tight.preflopFloor>loose.preflopFloor);assert.ok(opponentRangeWeight(base,0,['7s','2c'])<opponentRangeWeight(base,0,['Ah','Ad']));assert.ok(opponentRangeWeight(base,0,['7s','2c'])<opponentRangeWeight(looseObservation,0,['7s','2c']));
+  assert.equal(equitySampleCount(base),700);const equity=estimateEquity(base,rng(913),80);assert.ok(equity>=0&&equity<=1);
+  assert.equal(equitySampleCount({...base,street:'flop',board:['9c','6h','2d'],pot:80,legal:{...base.legal,toCall:0}}),160);
 });
 test('complete bot games traverse all streets without illegal actions',()=>{
   const random=rng(876);

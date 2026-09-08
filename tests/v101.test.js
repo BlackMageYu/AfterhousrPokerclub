@@ -79,6 +79,17 @@ test('quick fold follows the current preflop hand when a local table advances be
   assert.equal(result.session.hand.number,currentHand);assert.equal(result.session.players[0].folded,true);assert.equal(result.session.hand.status,'complete');
 });
 
+test('direct quick fold also refreshes a stale rendered hand revision',t=>{
+  const root=close(t),store=new GameStore({root});
+  store.dispatch('start',{config:{seats:3}});const engine=store.session.engine,staleTurn=turn(store);
+  while(engine.active){if(engine.hand.actor===null)engine.advance();else{const legal=engine.legal();engine.act(engine.hand.actor,legal.canCheck?'check':'call');}}
+  engine.startHand();const currentHand=engine.hand.number;
+  const result=store.dispatch('action',{...staleTurn,action:'fold',fastFold:true});
+  assert.equal(result.session.hand.number,currentHand);
+  assert.equal(result.session.players[0].folded,true);
+  assert.equal(result.session.hand.status,'complete');
+});
+
 test('an API client that ignores cancellation still yields the turn to the local strategy',async t=>{
   const root=close(t),store=new GameStore({root}),settings=new AISettings({root});settings.update({mode:'external',baseUrl:'https://example.invalid/v1',model:'test',apiKey:'test-key'});
   const service=new AIGameService(store,settings,{useLocalRules:false,actionWindowMs:5,request:()=>new Promise(()=>{})});

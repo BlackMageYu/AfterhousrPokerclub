@@ -205,6 +205,18 @@ export class GameStore {
     if(body.sessionId!==this.session.id)throw new Error('场次已变化，请以当前牌桌为准');
     const e=this.session.engine;
     if(name!=='end'&&!e.active&&this.session.expiresAt&&Date.now()>=new Date(this.session.expiresAt).getTime()){this.end('房间时间到');return this.state();}
+    // Quick fold is an intent for the *current* pre-flop hand, not a command
+    // tied to an old visual event.  The native client can render the next hand
+    // while a previously queued table tick is still returning.  Let the quick
+    // fold adopt that current hand so the player never needs to click twice.
+    // Other actions deliberately retain the strict revision check below.
+    if(name==='action'&&body.fastFold===true){
+      const h=e.hand,hero=e.players[0];
+      if(!e.active||h?.status!=='playing'||h.street!=='preflop'||!hero||hero.folded||hero.allIn||!h.pending.includes(0))return this.state();
+      e.fastFold(0);
+      if(e.active&&e.hand.fastForwardBots)this.finishHandFast(e,{fastAfterFold:true});
+      this.session.wallet=this.profile.wallet;this.save();return this.state();
+    }
     if(['action','tick','show','next','extend','timeout'].includes(name)&&(body.handNumber!==e.hand?.number||body.eventCount!==e.hand?.events.length))throw new Error('牌局已更新，请以当前牌局为准');
     if(name==='action'){
       if(body.fastFold===true&&e.hand.actor!==0)e.fastFold(0);
